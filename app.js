@@ -904,18 +904,30 @@ if (!skipVarisai) {
   if (!isPlaying) break;
 
   // 🔁 HANDLE SKIP REQUESTS (single source of truth)
+  //
+  // IMPORTANT: When a skip is triggered mid-playback, hardStopAllAudio() causes
+  // playPattern() to return "SKIP". The inner line loop then breaks, and the outer
+  // for-loop executes its own currentQueueIndex++ BEFORE reaching this check again
+  // via continue. So currentQueueIndex here is already 1 ahead of where playback
+  // actually stopped. We correct with (currentQueueIndex - 1) as the played index.
 if (skipRequested === "FORWARD") {
   skipRequested = false;
-  currentQueueIndex = findNextPatternIndex(currentQueueIndex) - 1;
-  lastPatternId = null; // force metronome reset on next iteration
+  const playedIndex = Math.max(0, currentQueueIndex - 1);
+  const nextPidStart = findNextPatternIndex(playedIndex);
+  currentQueueIndex = nextPidStart - 1; // -1 because for-loop continue will ++ again
+  lastPatternId = null;
   continue;
 }
 
 if (skipRequested === "BACKWARD") {
   skipRequested = false;
-  const currentStart = findPatternStartIndex(currentQueueIndex);
-  currentQueueIndex = findPrevPatternIndex(currentStart) - 1;
-  lastPatternId = null; // force metronome reset on next iteration
+  const playedIndex = Math.max(0, currentQueueIndex - 1);
+  const currentStart = findPatternStartIndex(playedIndex);
+  const target = (playedIndex - currentStart <= 1 && currentStart > 0)
+    ? findPrevPatternIndex(currentStart)
+    : currentStart;
+  currentQueueIndex = target - 1; // -1 because for-loop continue will ++ again
+  lastPatternId = null;
   continue;
 }
 

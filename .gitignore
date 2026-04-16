@@ -29,9 +29,6 @@ Desktop.ini
 dist/
 build/
 
-# Large media files — host externally (YouTube etc.)
-abhyasa_demo.mp4
-
 # Python HTTP server artefacts
 __pycache__/
 *.pyc
