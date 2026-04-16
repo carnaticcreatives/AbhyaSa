@@ -534,7 +534,7 @@
     btn.innerHTML = '<span class="spinner"></span>Sending…';
 
     // Use exact current page URL (no hash/query) — must match Supabase Redirect URLs allowlist
-    const redirectTo = window.location.href.split('#')[0].split('?')[0];
+    const redirectTo = 'https://carnaticcreatives.github.io/AbhyaSa/index.html';
 
     const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo });
 
