@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CARNATIC CREATIVES AbhyaSa</title>
+<link rel="icon" href="icon-512.png">
+<link rel="stylesheet" href="styles.css">
+
+<!-- ── SESSION GUARD — must be first script, blocks everything else ───────
+     Checks Supabase session + active subscription before the app loads.
+     If either check fails, the user is immediately sent back to index.html.
+     ──────────────────────────────────────────────────────────────────── -->
+<script src="supabase.min.js"></script>
+<script src="config.js"></script>
+<script>
+
+  // Hide the entire page until auth check passes
+  document.documentElement.style.visibility = 'hidden';
+
+  (async function sessionGuard() {
+    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+    // 1. Check session
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) {
+      window.location.href = 'index.html';
+      return;
+    }
+    await sb.auth.setSession(session);   // ← add this line
+
+    // 2. Check active subscription (server-side query — cannot be faked client-side)
+    const { data: sub } = await sb
+      .from('subscriptions')
+      .select('id, expiry_date')
+      .eq('user_id', session.user.id)
+      .eq('status', 'active')
+      .gt('expiry_date', new Date().toISOString())
+      .maybeSingle();
+
+    if (!sub) {
+      // Signed in but no active subscription — send to login page
+      await sb.auth.signOut();
+      window.location.href = 'index.html';
+      return;
+    }
+
+    // 3. Auth passed — expose user info to the app and show the page
+    const userName = session.user.user_metadata?.full_name || session.user.email;
+    window.__appUser = {
+      id:          session.user.id,
+      email:       session.user.email,
+      name:        userName,
+      expiryDate:  sub.expiry_date,
+      supabase:    sb
+    };
+
+    // Set name before page becomes visible — no "Loading…" flash
+    document.getElementById('bar-name').textContent = userName;
+
+    document.documentElement.style.visibility = 'visible';
+
+    // Initialise scoring engine and reload ragams from Supabase
+    window.addEventListener('load', () => {
+      if (typeof scoringInit === 'function') scoringInit();
+      if (typeof ragamInit === 'function') ragamInit();
+      showExpiryWarning(sub.expiry_date);
+    });
+    if (document.readyState === 'complete') {
+      if (typeof scoringInit === 'function') scoringInit();
+      if (typeof ragamInit === 'function') ragamInit();
+      showExpiryWarning(sub.expiry_date);
+    }
+
+    // ── Mid-session subscription recheck ──────────────────────────────────
+    // Queries the subscriptions table live every 30 minutes.
+    // If status is no longer active (expired or revoked by admin), the user
+    // is signed out immediately rather than continuing indefinitely.
+    async function recheckSubscription() {
+      try {
+        const { data: liveSub } = await sb
+          .from('subscriptions')
+          .select('id')
+          .eq('user_id', session.user.id)
+          .eq('status', 'active')
+          .gt('expiry_date', new Date().toISOString())
+          .maybeSingle();
+
+        if (!liveSub) {
+          // Subscription has expired or been revoked — log out and redirect
+          await sb.auth.signOut();
+          window.location.href = 'index.html?reason=expired';
+        }
+      } catch(e) {
+        // Network failure — do nothing, try again next interval
+      }
+    }
+
+    // Run recheck every 30 minutes
+    setInterval(recheckSubscription, 30 * 60 * 1000);
+
+    // Also recheck whenever the user returns to a background tab —
+    // this catches the common case of leaving the app open overnight
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') recheckSubscription();
+    });
+
+  })();
+</script>
+
+<style>
+  /* ── User bar ─────────────────────────────────────────────────────────── */
+  #user-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: #f5f0e8;
+    border-bottom: 1px solid #d4c9a8;
+    font-size: 12.5px;
+    color: #7a6e58;
+    margin: -20px -20px 14px -20px;
+  }
+  #user-bar .user-name { font-weight: 600; color: #2c2416; }
+  #user-bar .expiry    { font-size: 11.5px; color: #9a8e78; margin-left: 8px; }
+  #user-bar .btn-logout {
+    background: none; border: 1px solid #c9bda0; border-radius: 2px;
+    padding: 3px 10px; font-size: 12px; color: #7a6e58; cursor: pointer;
+    transition: background 0.15s;
+  }
+  #user-bar .btn-logout:hover { background: #e8dfc8; color: #2c2416; }
+
+  /* ── AbhyaSa logo header band ────────────────────────────────────────── */
+  #app-logo-header {
+    background: #8b2e0f;
+    padding: 5px 12px;
+    margin: -20px -20px 18px -20px;
+    position: relative;
+    overflow: hidden;
+  }
+  #app-logo-header::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(45deg, transparent, transparent 8px,
+      rgba(255,255,255,0.03) 8px, rgba(255,255,255,0.03) 16px);
+    pointer-events: none;
+  }
+
+  /* Tambura separator — visual gap between Janya and Tambura only */
+  .raga-type-sep {
+    display: inline-block;
+    width: 1px;
+    height: 16px;
+    background: #d4c9a8;
+    margin: 0 8px;
+    vertical-align: middle;
+  }
+
+  /* ── Expiry warning bar ──────────────────────────────────────────────── */
+  #expiry-warning {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px;
+    margin: -14px -20px 14px -20px;
+    font-size: 12.5px;
+    line-height: 1.4;
+  }
+  #expiry-warning.warn-soon  {
+    display: flex;
+    background: #fdf8ee;
+    border-bottom: 1px solid #e0c97a;
+    color: #5c4210;
+  }
+  #expiry-warning.warn-urgent {
+    display: flex;
+    background: #fdf0ee;
+    border-bottom: 1px solid #e8b4aa;
+    color: #7a2015;
+  }
+  #expiry-warning .warn-icon   { font-size: 14px; flex-shrink: 0; }
+  #expiry-warning .warn-text   { flex: 1; }
+  #expiry-warning .warn-renew  {
+    font-weight: 600; color: inherit; text-decoration: underline;
+    cursor: pointer; background: none; border: none;
+    font-size: 12.5px; padding: 0; white-space: nowrap;
+  }
+  #expiry-warning .warn-dismiss {
+    background: none; border: none; color: inherit; opacity: 0.5;
+    font-size: 16px; cursor: pointer; padding: 0 2px; flex-shrink: 0;
+    line-height: 1;
+  }
+  #expiry-warning .warn-dismiss:hover { opacity: 1; }
+</style>
+</head>
+
+<body>
+
+<!-- User bar — populated by JS after auth check -->
+<div id="user-bar">
+  <div>
+    <span class="user-name" id="bar-name"></span>
+    <span class="expiry" id="bar-expiry"></span>
+  </div>
+  <button class="btn-logout" onclick="doLogout()">Sign out</button>
+</div>
+
+<!-- Expiry warning bar — shown when subscription is within 30 days of expiry -->
+<div id="expiry-warning">
+  <span class="warn-icon" id="warn-icon">⚠</span>
+  <span class="warn-text" id="warn-text"></span>
+  <button class="warn-renew" onclick="window.location.href='index.html#subscribe'">Renew</button>
+  <button class="warn-dismiss" onclick="document.getElementById('expiry-warning').style.display='none'" title="Dismiss">✕</button>
+</div>
+
+<!-- AbhyaSa logo header — slim band -->
+<div id="app-logo-header">
+  <svg width="100%" viewBox="0 0 420 26" role="img" xmlns="http://www.w3.org/2000/svg"
+       style="display:block; max-width:700px; margin:0 auto; position:relative; z-index:1;">
+    <title>AbhyaSa — An aid to structured Carnatic music practice</title>
+
+    <!-- Tanpura — scaled to slim band height -->
+    <g transform="translate(2, 0) scale(0.065)">
+      <ellipse cx="60" cy="320" rx="55" ry="48" fill="#d4844a"/>
+      <path d="M50,280 Q52,180 54,40 L66,40 Q68,180 70,280 Z" fill="#c86c38"/>
+      <path d="M54,40 Q52,10 40,6 Q30,3 28,14 Q26,24 36,28 Q46,32 54,40" fill="#a04820"/>
+      <path d="M66,40 Q68,10 78,6 Q86,3 88,14 Q90,24 82,28 Q72,32 66,40" fill="#a04820"/>
+      <circle cx="32" cy="18" r="5" fill="#f0d080"/>
+      <circle cx="92" cy="18" r="5" fill="#f0d080"/>
+      <line x1="52" y1="281" x2="40" y2="40" stroke="#f0d080" stroke-width="1.5" fill="none"/>
+      <line x1="68" y1="281" x2="80" y2="40" stroke="#f0d080" stroke-width="1.5" fill="none"/>
+    </g>
+
+    <!-- Brand name -->
+    <text x="12" y="19" font-family="Georgia, serif" font-size="18" font-weight="700" fill="#ffffff" letter-spacing="-0.5">Abhy<tspan fill="#f5d090">a</tspan>Sa</text>
+
+    <!-- Vertical divider -->
+    <line x1="110" y1="4" x2="110" y2="22" stroke="rgba(255,255,255,0.3)" stroke-width="0.8"/>
+
+    <!-- Tagline -->
+    <text x="118" y="18" font-family="Georgia, serif" font-size="10" font-style="italic" fill="rgba(255,255,255,0.75)">An aid to structured Carnatic music practice</text>
+
+    <!-- Attribution -->
+    <text x="415" y="24" text-anchor="end" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.3)">by CARNATIC CREATIVES</text>
+  </svg>
+</div>
+
+<label>Ragam Type</label>
+<div class="raga-type">
+  <label>
+    <input type="radio" name="ragaType" value="sampoorna">
+    Sampoorna
+  </label>
+  <label>
+    <input type="radio" name="ragaType" value="audava">
+    Audava
+  </label>
+  <label>
+    <input type="radio" name="ragaType" value="shadava">
+    Shadava
+  </label>
+  <label>
+    <input type="radio" name="ragaType" value="janya">
+    Janya
+  </label>
+  <span class="raga-type-sep"></span>
+  <label>
+    <input type="radio" name="ragaType" value="tambura" checked>
+    Tambura only
+  </label>
+  <span class="raga-type-sep"></span>
+  <label id="firstSpeedLabel" style="font-weight:normal; color:#555;">
+    <input type="checkbox" id="firstSpeedOnly"> 1st Speed only
+  </label>
+</div>
+
+<label>Ragam</label>
+<div id="janyaSearchWrap">
+  <input type="text" id="janyaSearch" placeholder="Type 3+ letters to search ragam…" autocomplete="off" spellcheck="false">
+  <div id="janyaDropdown"></div>
+</div>
+<select id="ragam"></select>
+
+<label>Varisai</label>
+<select id="varisai"></select>
+
+
+<div class="speed">
+
+  <label><input type="radio" name="speed" value="60"> 60 BPM</label>
+  <label><input type="radio" name="speed" value="80" checked> 80 BPM</label>
+  <label><input type="radio" name="speed" value="100"> 100 BPM</label>
+
+  <div class="sruti-control">
+    <label for="sruti">Sruti:</label>
+    <select id="sruti">
+      <option value="C">C / 1 Kattai</option>
+      <option value="C#">C# / 1.5 Kattai</option>
+      <option value="D">D / 2 Kattai</option>
+      <option value="D#">D# / 2.5 Kattai</option>
+      <option value="E">E / 3 Kattai</option>
+      <option value="F">F / 4 Kattai</option>
+      <option value="F#">F# / 4.5 Kattai</option>
+      <option value="G">G / 5 Kattai</option>
+      <option value="G#">G# / 5.5 Kattai</option>
+      <option value="A">A / 6 Kattai</option>
+      <option value="A#">A# / 6.5 Kattai</option>
+      <option value="B">B / 7 Kattai</option>
+    </select>
+  </div>
+
+  <div class="metronome-control">
+    <label>
+      <input type="checkbox" id="metronomeOn" checked> Metronome
+    </label>
+    <span id="metronomeBeatDisplay" style="display:none"></span>
+  </div>
+
+  <div class="transport">
+    <button onclick="skipBackward()">⏮</button>
+    <button onclick="togglePlay()">▶ / ⏹</button>
+    <button onclick="skipForward()">⏭</button>
+  </div>
+
+</div>
+
+
+<progress id="progress" value="0" max="100" style="width:100%;margin:6px 0;height:6px;accent-color:#8b2e0f"></progress>
+
+<div id="display">
+  <div id="staticInfo"></div>
+  <div id="dynamicInfo"></div>
+  
+</div>
+
+<!-- Data and app logic — load AFTER session guard has run -->
+<!-- config.js already loaded in <head>; listed here for clarity only -->
+<script src="data.js"></script>
+<script src="app.js"></script>
+<script src="practice-scoring.js"></script>
+
+<script>
+  // ── Expiry warning bar ─────────────────────────────────────────────────────
+  // Called from the session guard once auth passes — shows a dismissible banner
+  // when the subscription expires within 30 days (urgent tone within 7 days).
+  function showExpiryWarning(expiryDateStr) {
+    if (!expiryDateStr) return;
+    const now        = new Date();
+    const expiry     = new Date(expiryDateStr);
+    const daysLeft   = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
+
+    if (daysLeft > 30) return; // no warning needed
+
+    const bar     = document.getElementById('expiry-warning');
+    const textEl  = document.getElementById('warn-text');
+    const iconEl  = document.getElementById('warn-icon');
+
+    if (daysLeft <= 0) {
+      // Shouldn't normally reach here (session guard blocks expired subs),
+      // but handle gracefully just in case of clock drift.
+      return;
+    } else if (daysLeft <= 7) {
+      bar.className = 'warn-urgent';
+      iconEl.textContent = '🔔';
+      textEl.textContent = daysLeft === 1
+        ? 'Your access expires tomorrow — renew now to avoid interruption.'
+        : `Your access expires in ${daysLeft} days — renew now to avoid interruption.`;
+    } else {
+      bar.className = 'warn-soon';
+      iconEl.textContent = '⚠';
+      textEl.textContent = `Your access expires in ${daysLeft} days.`;
+    }
+  }
+
+  // ── Logout ─────────────────────────────────────────────────────────────────
+  async function doLogout() {
+    const u = window.__appUser;
+    if (u?.supabase) await u.supabase.auth.signOut();
+    window.location.href = 'index.html';
+  }
+</script>
+
+</body>
+</html>

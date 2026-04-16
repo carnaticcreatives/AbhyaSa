@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AbhyaSa — Coupon Code Generator</title>
+<script src="supabase.min.js"></script>
+<script src="config.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --cream: #faf7f2; --parchment: #f0ead8; --border: #d4c9a8;
+    --text: #2c2416; --muted: #7a6e58;
+    --accent: #8b2e0f; --shadow: rgba(44,36,22,0.12);
+  }
+  body { background: var(--cream); font-family: Arial, sans-serif; padding: 28px; color: var(--text); }
+  h1 { font-family: Georgia, serif; font-size: 22px; color: var(--accent); margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: var(--muted); margin-bottom: 24px; }
+  .card {
+    background: white; border: 1px solid var(--border);
+    box-shadow: 0 2px 10px var(--shadow); padding: 24px;
+    max-width: 600px; margin-bottom: 24px;
+  }
+  .card h2 { font-size: 15px; color: var(--accent); margin-bottom: 16px; letter-spacing: .08em; text-transform: uppercase; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; color: var(--muted); }
+  input, select {
+    width: 100%; padding: 8px 10px; font-size: 14px; margin-bottom: 14px;
+    border: 1px solid var(--border); border-radius: 2px; background: var(--parchment);
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); background: white; }
+  .btn { padding: 9px 20px; font-size: 14px; border: none; border-radius: 2px; cursor: pointer; font-weight: 600; }
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: #6e2409; }
+  .btn-primary:disabled { background: #c9a090; cursor: not-allowed; }
+  .btn-secondary { background: none; border: 1px solid var(--accent); color: var(--accent); }
+  .btn-secondary:hover { background: #f5ece8; }
+  #auth-section .row { display: flex; gap: 10px; align-items: flex-end; }
+  #auth-section .row > div { flex: 1; }
+  #auth-status {
+    font-size: 13px; padding: 8px 12px; border-radius: 2px; margin-bottom: 16px; display: none;
+  }
+  #auth-status.ok  { display: block; background: #edf7ed; border: 1px solid #a8d5a8; color: #1a5c1a; }
+  #auth-status.err { display: block; background: #fdf0ee; border: 1px solid #e8b4aa; color: #7a2015; }
+  #result-area { display: none; margin-top: 16px; }
+  #result-area .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  #result-area h3 { font-size: 14px; color: var(--accent); }
+  #code-list {
+    background: var(--parchment); border: 1px solid var(--border);
+    padding: 12px 14px; font-family: monospace; font-size: 14px;
+    line-height: 2; max-height: 320px; overflow-y: auto; letter-spacing: .04em;
+  }
+  .copy-all-btn { font-size: 12px; padding: 4px 12px; }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #2c2416; color: white; padding: 8px 18px;
+    border-radius: 20px; font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  #preview-code { font-family: monospace; font-size: 13px; color: var(--muted); margin-top: -10px; margin-bottom: 14px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: -10px; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+
+<h1>AbhyaSa — Coupon Generator</h1>
+<p class="subtitle">Admin utility — generates coupon codes and inserts them directly into Supabase.</p>
+
+<!-- Step 1: Auth -->
+<div class="card" id="auth-section">
+  <h2>1 · Admin sign-in</h2>
+  <div id="auth-status"></div>
+  <div class="row">
+    <div>
+      <label>Email</label>
+      <input type="email" id="admin-email" placeholder="admin@example.com">
+    </div>
+    <div>
+      <label>Password</label>
+      <input type="password" id="admin-password" placeholder="••••••••">
+    </div>
+  </div>
+  <button class="btn btn-primary" onclick="doSignIn()">Sign in</button>
+  <button class="btn btn-secondary" style="margin-left:8px" onclick="doSignOut()">Sign out</button>
+</div>
+
+<!-- Step 2: Generate -->
+<div class="card" id="generate-section">
+  <h2>2 · Generate codes</h2>
+
+  <label>Teacher (optional)</label>
+  <select id="teacher-select">
+    <option value="">— Admin / no teacher —</option>
+  </select>
+  <p class="hint">Leave blank to generate unattributed admin codes. Teachers must have role = 'teacher' in profiles.</p>
+
+  <label>Quantity</label>
+  <input type="number" id="quantity" value="10" min="1" max="100">
+
+  <div id="preview-code"></div>
+
+  <button class="btn btn-primary" id="gen-btn" onclick="generateCodes()">Generate codes</button>
+
+  <div id="result-area">
+    <div class="result-header">
+      <h3 id="result-title"></h3>
+      <button class="btn btn-secondary copy-all-btn" onclick="copyAll()">Copy all</button>
+    </div>
+    <div id="code-list"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ── Supabase client ─────────────────────────────────────────────────────── */
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+/* ── Date prefix: CMP-yymm-dd ───────────────────────────────────────────── */
+function todayPrefix() {
+  const d  = new Date();
+  const yy = String(d.getFullYear()).slice(-2);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `CMP-${yy}${mm}-${dd}`;
+}
+
+function updatePreview() {
+  const p = todayPrefix();
+  const q = parseInt(document.getElementById('quantity').value) || 1;
+  document.getElementById('preview-code').textContent =
+    `Preview: ${p}01 … ${p}${String(q).padStart(2, '0')}  (exact serial depends on codes already generated today)`;
+}
+document.getElementById('quantity').addEventListener('input', updatePreview);
+updatePreview();
+
+/* ── Auth ───────────────────────────────────────────────────────────────── */
+async function doSignIn() {
+  const email    = document.getElementById('admin-email').value.trim();
+  const password = document.getElementById('admin-password').value;
+  const status   = document.getElementById('auth-status');
+
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
+    status.className = 'err';
+    status.textContent = '✕ ' + error.message;
+    return;
+  }
+
+  // Verify role = 'admin' in profiles before granting access
+  const { data: profile } = await sb
+    .from('profiles')
+    .select('role, full_name')
+    .eq('id', data.user.id)
+    .single();
+
+  if (!profile || profile.role !== 'admin') {
+    await sb.auth.signOut();
+    status.className = 'err';
+    status.textContent = '✕ Access denied — this account does not have admin role.';
+    return;
+  }
+
+  status.className = 'ok';
+  status.textContent = `✓ Signed in as ${profile.full_name || data.user.email} (admin)`;
+  await loadTeachers();
+}
+
+async function doSignOut() {
+  await sb.auth.signOut();
+  const s = document.getElementById('auth-status');
+  s.className = 'err';
+  s.textContent = 'Signed out.';
+  document.getElementById('teacher-select').innerHTML = '<option value="">— Admin / no teacher —</option>';
+}
+
+/* ── Load teachers from profiles where role = 'teacher' ────────────────── */
+async function loadTeachers() {
+  const sel = document.getElementById('teacher-select');
+  sel.innerHTML = '<option value="">— Admin / no teacher —</option>';
+
+  const { data, error } = await sb
+    .from('profiles')
+    .select('id, full_name, email')
+    .eq('role', 'teacher')
+    .order('full_name', { ascending: true });
+
+  if (error) {
+    showToast('Could not load teachers: ' + error.message);
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    const opt = document.createElement('option');
+    opt.disabled = true;
+    opt.textContent = '(no teachers found — set role = teacher in profiles)';
+    sel.appendChild(opt);
+    return;
+  }
+
+  data.forEach(row => {
+    const opt       = document.createElement('option');
+    opt.value       = row.id;
+    opt.textContent = row.full_name || row.email || row.id;
+    sel.appendChild(opt);
+  });
+}
+
+/* ── Generate codes ─────────────────────────────────────────────────────── */
+async function generateCodes() {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) { showToast('Please sign in first'); return; }
+
+  const qty       = parseInt(document.getElementById('quantity').value) || 10;
+  const teacherId = document.getElementById('teacher-select').value || null;
+  const btn       = document.getElementById('gen-btn');
+
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+
+  try {
+    const prefix = todayPrefix();
+
+    // Count codes already created today — column name is 'code' (not 'coupon_code')
+    const { count } = await sb
+      .from('coupon_codes')
+      .select('*', { count: 'exact', head: true })
+      .like('code', `${prefix}%`);
+
+    const startSerial = (count || 0) + 1;
+
+    // Build rows — 'code' column, not 'coupon_code'
+    const rows = Array.from({ length: qty }, (_, i) => ({
+      code:       `${prefix}${String(startSerial + i).padStart(2, '0')}`,
+      teacher_id: teacherId,
+      status:     'unused',
+    }));
+
+    const { data: inserted, error } = await sb
+      .from('coupon_codes')
+      .insert(rows)
+      .select('code');
+
+    if (error) throw new Error(error.message);
+
+    const codes = inserted.map(r => r.code);
+    displayResults(codes, teacherId);
+    showToast(`✓ ${codes.length} codes generated`);
+
+  } catch (e) {
+    showToast('✕ Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate codes';
+  }
+}
+
+function displayResults(codes, teacherId) {
+  const sel   = document.getElementById('teacher-select');
+  const label = teacherId
+    ? (sel.options[sel.selectedIndex]?.textContent || teacherId)
+    : 'Admin (no teacher)';
+
+  document.getElementById('result-title').textContent =
+    `${codes.length} codes for: ${label}`;
+  document.getElementById('code-list').innerHTML =
+    codes.map(c => `<div>${c}</div>`).join('');
+  document.getElementById('result-area').style.display = 'block';
+}
+
+function copyAll() {
+  const lines = [...document.querySelectorAll('#code-list div')].map(d => d.textContent);
+  navigator.clipboard.writeText(lines.join('\n'))
+    .then(() => showToast('Copied ' + lines.length + ' codes'))
+    .catch(() => showToast('Copy failed — select manually'));
+}
+
+function showToast(msg, ms = 3000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), ms);
+}
+
+/* Restore session on page load if already signed in — re-verify admin role */
+(async () => {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return;
+
+  const { data: profile } = await sb
+    .from('profiles')
+    .select('role, full_name')
+    .eq('id', session.user.id)
+    .single();
+
+  const s = document.getElementById('auth-status');
+  if (profile?.role === 'admin') {
+    s.className = 'ok';
+    s.textContent = `✓ Signed in as ${profile.full_name || session.user.email} (admin)`;
+    await loadTeachers();
+  } else {
+    await sb.auth.signOut();
+    s.className = 'err';
+    s.textContent = 'Session restored but role is not admin — please sign in again.';
+  }
+})();
+</script>
+</body>
+</html>

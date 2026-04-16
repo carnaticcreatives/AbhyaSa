@@ -1,0 +1,224 @@
+body { font-family: Arial, sans-serif; margin: 20px; }
+label { font-weight: bold; }
+select, textarea, button { width: 100%; margin: 6px 0; padding: 6px; }
+.speed label { margin-right: 12px; font-weight: normal; }
+.speed {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;   /* wraps nicely on small screens */
+}
+#display { border: 1px solid #999; padding: 10px; margin-top: 10px; }
+.sruti-control {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 16px;
+}
+
+.sruti-control label {
+  font-weight: normal;
+  margin-right: 6px;
+}
+
+#sruti {
+  width: 150px;
+  padding: 2px 4px;
+  font-size: 14px;
+}
+
+/* Sruti fine-tune slider */
+
+
+/* === Transport controls (Play / Skip buttons) === */
+
+.transport {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 16px;
+  gap: 6px;
+}
+
+.transport button {
+  width: auto;          /* override 100% width */
+  padding: 4px 10px;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+/* === Metronome control === */
+.metronome-control {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 16px;
+  gap: 6px;
+  font-weight: normal;
+}
+.metronome-control label {
+  font-weight: normal;
+}
+#metronomeBeatDisplay {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: 8px;
+}
+.beat-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ccc;
+  transition: background 0.05s;
+}
+.beat-dot.sam { background: #ccc; width: 16px; height: 16px; }
+
+/* Lit colours by accent type — sam is larger dot only, no special colour */
+.beat-dot.lit-laghu    { background: #e03030 !important; }  /* laghu — red */
+.beat-dot.lit-wave     { background: #1a6fd4 !important; }  /* drutam beat — blue */
+.beat-dot.lit-finger   { background: #1a6fd4 !important; }  /* drutam flip — blue */
+.beat-dot.lit-anudruta { background: #c9a000 !important; }  /* anudruta — yellow */
+
+/* ── Mobile Responsive ─────────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  body { margin: 12px; }
+
+  h2 { font-size: 18px; margin-bottom: 10px; }
+
+  /* Stack radio buttons vertically for raga type */
+  .raga-type { display: flex; flex-wrap: wrap; gap: 6px; }
+  .raga-type label { margin-right: 8px; font-size: 15px; }
+
+  /* Bigger tap targets for selects and buttons */
+  select, textarea, button {
+    font-size: 16px;   /* prevents iOS auto-zoom on focus */
+    padding: 10px 8px;
+    margin: 8px 0;
+  }
+
+  /* Speed + sruti row: stack vertically */
+  .speed {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .speed label { font-size: 15px; }
+
+  /* Sruti control: full width on mobile */
+  .sruti-control {
+    margin-left: 0;
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  #sruti { width: 100%; font-size: 16px; }
+
+
+
+  /* Metronome control on mobile */
+  .metronome-control {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  /* Transport buttons: bigger, easier to tap */
+  .transport {
+    margin-left: 0;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .transport button {
+    font-size: 22px;
+    padding: 10px 12px;
+    flex: 1;
+  }
+
+  /* Display area */
+  #display { padding: 10px; font-size: 15px; }
+
+  /* Janya search */
+  #janyaSearch { font-size: 16px; padding: 10px; }
+  .jd-item { padding: 10px 12px; font-size: 14px; }
+}
+
+/* === FORCE RADIO VISIBILITY (Chromium fix) === */
+input[type="radio"] {
+  appearance: radio;
+  -webkit-appearance: radio;
+  width: auto;
+  margin-right: 6px;
+}
+
+.raga-type label {
+  font-weight: normal;   /* override global bold */
+  margin-right: 14px;
+}
+
+/* ── Janya Ragam search widget ─────────────────────────────────────────── */
+#janyaSearchWrap {
+  display: none;           /* shown only when Janya is selected */
+  position: relative;
+  width: 100%;
+  margin: 6px 0;
+}
+#janyaSearch {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-size: 14px;
+  border: 1px solid #888;
+  border-radius: 4px;
+  font-family: Arial, sans-serif;
+}
+#janyaSearch:focus { outline: 2px solid #4a90d9; border-color: #4a90d9; }
+
+#janyaDropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #aaa;
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  z-index: 9999;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+}
+#janyaDropdown.open { display: block; }
+
+.jd-item {
+  padding: 7px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #222;
+  border-bottom: 1px solid #f0f0f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.jd-item:last-child { border-bottom: none; }
+.jd-item:hover, .jd-item.active {
+  background: #e8f0fe;
+  color: #1a56c4;
+}
+.jd-item .jd-name { font-weight: 500; }
+.jd-item .jd-meta { font-size: 11px; color: #777; margin-left: 8px; white-space: nowrap; }
+.jd-item mark {
+  background: #fff3b0;
+  color: #222;
+  font-weight: bold;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.jd-count {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: #888;
+  background: #f7f7f7;
+  border-bottom: 1px solid #eee;
+  font-style: italic;
+}
+

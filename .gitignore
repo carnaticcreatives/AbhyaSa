@@ -1,0 +1,40 @@
+# ── AbhyaSa — .gitignore ──────────────────────────────────────────────────
+
+# Node (not used now, but included in case tooling is added later)
+node_modules/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+
+# Editor directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment / secrets
+# (The anon key in config.js IS intentionally committed — it is public.
+#  Never add a .env containing the Supabase service-role key to this repo.)
+.env
+.env.*
+*.secret
+
+# Build / deploy artefacts
+dist/
+build/
+
+# Large media files — host externally (YouTube etc.)
+abhyasa_demo.mp4
+
+# Python HTTP server artefacts
+__pycache__/
+*.pyc
+
+# Local test output
+*.log
