@@ -1,0 +1,24 @@
+{
+  "name": "carnaticcreatives",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carnaticcreatives/AbhyaSa.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/carnaticcreatives/AbhyaSa/issues"
+  },
+  "homepage": "https://github.com/carnaticcreatives/AbhyaSa#readme",
+  "dependencies": {
+    "playwright": "^1.59.1"
+  }
+}

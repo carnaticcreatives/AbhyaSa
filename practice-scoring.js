@@ -537,28 +537,27 @@ async function showSessionHistory() {
   if (!modal || !tbody) return;
 
   if (!sessions.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#888;padding:16px">No sessions recorded yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#888;padding:16px">No sessions recorded yet</td></tr>';
   } else {
     tbody.innerHTML = sessions.map(s => {
       const d   = new Date(s.session_start);
       const fmt = d.toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' });
       const tm  = d.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' });
 
-      // Singing — verbal label with colour
-      let singHtml;
-      if (s.singing_score === null || s.singing_score === undefined) {
-        singHtml = `<span style="color:#aaa;font-size:12px">N/A</span>`;
-      } else {
-        const b = singingBand(s.singing_score);
-        singHtml = `<span style="color:${b.color};font-weight:600;font-size:12.5px">${b.label}</span>`;
-      }
+      // Singing — verbal label with colour (no numeric score shown)
+      const sing    = singingBand(s.singing_score);
+      const singHtml = s.singing_score === null || s.singing_score === undefined
+        ? `<span style="color:#aaa;font-size:12px">—</span>`
+        : `<span style="color:${sing.color};font-weight:600;font-size:12.5px">${sing.label}</span>`;
 
-      // Duration — plain text
+      // Duration — plain minutes text
       const durMin  = s.session_minutes ?? '—';
       const durHtml = `<span style="font-size:12.5px">${durMin} min</span>`;
 
-      // Variety — count
-      const ragCnt  = s.ragams_sung ? s.ragams_sung.split(',').filter(Boolean).length : (s.ragam_score != null ? Math.round(s.ragam_score / 25) : '—');
+      // Variety — count of ragams only (verbal, no score number)
+      const ragCnt  = s.ragams_sung
+        ? s.ragams_sung.split(',').filter(Boolean).length
+        : (s.ragam_score != null ? Math.round(s.ragam_score / 25) : '—');
       const ragHtml = `<span style="font-size:12.5px">${ragCnt} ragam${ragCnt === 1 ? '' : 's'}</span>`;
 
       return `<tr>
@@ -566,7 +565,6 @@ async function showSessionHistory() {
         <td>${singHtml}</td>
         <td>${durHtml}</td>
         <td>${ragHtml}</td>
-        <td style="font-size:11px;color:#888">${s.ragams_sung || '—'}</td>
       </tr>`;
     }).join('');
   }
@@ -609,11 +607,6 @@ function injectScoringUI() {
       border: none; border-radius: 2px; font-size: 12px; cursor: pointer;
     }
     #sc-end-btn:hover { background: #6e2409; }
-    #sc-history-btn {
-      padding: 4px 10px; background: none; color: #8b2e0f;
-      border: 1px solid #8b2e0f; border-radius: 2px; font-size: 12px; cursor: pointer;
-    }
-    #sc-history-btn:hover { background: #f0e8df; }
     .sc-modal-overlay {
       display: none; position: fixed; inset: 0;
       background: rgba(0,0,0,0.45); z-index: 9000;
@@ -689,7 +682,6 @@ function injectScoringUI() {
     panel.innerHTML = `
       <span id="sc-mic-dot"></span>
       <span id="sc-ragam-count">0 ragams</span>
-      <button id="sc-history-btn" onclick="showSessionHistory()">History</button>
       <button id="sc-end-btn" onclick="scoringEndSession()">End Session</button>
     `;
     displayDiv.before(panel);
@@ -713,7 +705,7 @@ function injectScoringUI() {
           <thead><tr>
             <th>Date &amp; Time</th>
             <th>Singing</th><th>Duration</th>
-            <th>Variety</th><th>Ragams practiced</th>
+            <th>Variety</th>
           </tr></thead>
           <tbody id="sc-history-body"></tbody>
         </table>

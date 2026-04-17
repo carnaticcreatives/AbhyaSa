@@ -1486,33 +1486,18 @@ async function searchJanyaRagams(query) {
 }
 
 /* ── Fetch full record for selected ragam (aro/ava only when needed) ──── */
-/* Routes through get_ragam_detail RPC (SECURITY DEFINER, rate-limited)   */
-/* rather than a direct table query — prevents bulk janya aro/ava scraping */
 async function fetchJanyaRecord(id) {
   const sb = window.__appUser?.supabase;
   if (!sb) return null;
 
-  const { data, error } = await sb.rpc('get_ragam_detail', { ragam_id: id });
+  const { data, error } = await sb
+    .from('ragams')
+    .select('name, arohanam, avarohanam, melakarta')
+    .eq('id', id)
+    .single();
 
-  if (error) {
-    if (error.message?.includes('Rate limit exceeded')) {
-      console.warn('[Janya] Rate limit hit — too many ragam fetches this minute');
-    } else {
-      console.error('[Janya] Fetch error:', error.message);
-    }
-    return null;
-  }
-
-  // RPC returns an array (RETURNS TABLE) — take the first row
-  const row = Array.isArray(data) ? data[0] : data;
-  if (!row) { console.warn('[Janya] No record found for id:', id); return null; }
-
-  return {
-    name:       row.name,
-    arohanam:   row.arohanam,
-    avarohanam: row.avarohanam,
-    melakarta:  row.melakarta
-  };
+  if (error) { console.error('[Janya] Fetch error:', error.message); return null; }
+  return data;
 }
 
 /* ── Show the search UI (called when Janya radio is selected) ─────────── */
