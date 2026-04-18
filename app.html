@@ -271,6 +271,42 @@
     vertical-align: middle;
   }
 
+  /* ── About modal ─────────────────────────────────────────────────────── */
+  #about-modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6); z-index: 9500;
+    align-items: flex-start; justify-content: center;
+    padding-top: 6px;
+  }
+  #about-modal-overlay.open { display: flex; }
+  #about-modal {
+    background: #fff; border-radius: 4px;
+    max-width: 400px; width: 96%; max-height: 96vh;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.35);
+    display: flex; flex-direction: column;
+  }
+  #about-modal img {
+    width: 100%; display: block;
+    min-height: 0; flex: 1 1 auto;
+    object-fit: contain; object-position: top;
+  }
+  .about-modal-footer {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px;
+    background: #f5f0e8; border-top: 1px solid #d4c9a8;
+    font-size: 12px; color: #7a6e58; flex-shrink: 0;
+  }
+  .about-modal-footer .about-version {
+    font-family: monospace; font-size: 11px; color: #9a8e78;
+  }
+  .about-modal-footer button {
+    padding: 5px 18px; font-size: 13px;
+    background: #8b2e0f; color: #fff;
+    border: none; border-radius: 2px; cursor: pointer; width: auto;
+  }
+  .about-modal-footer button:hover { background: #6e2409; }
+  
   /* ── Expiry warning bar ──────────────────────────────────────────────── */
   #expiry-warning {
     display: none;
@@ -353,9 +389,15 @@
       <button id="ud-sruti-save" onclick="saveDefaultSruti()">Save</button>
       <div id="ud-sruti-msg">✓ Saved</div>
     </div>
-
+    
     <div class="udrop-divider"></div>
-    <!-- 4. Sign out -->
+    <!-- 4. About -->
+    <div class="udrop-item" onclick="closeUserMenu(); showAbout()">
+      <span class="ud-icon">ℹ️</span> About
+    </div>
+    
+    <div class="udrop-divider"></div>
+    <!-- 5. Sign out -->
     <div class="udrop-item" onclick="doLogout()">
       <span class="ud-icon">🚪</span> Sign out
     </div>
@@ -497,6 +539,40 @@
 <script src="practice-scoring.js"></script>
 
 <script>
+
+  // ── About modal ────────────────────────────────────────────────────────────
+  async function showAbout() {
+    if (!document.getElementById('about-modal-overlay')) {
+      const overlay = document.createElement('div');
+      overlay.id = 'about-modal-overlay';
+      overlay.innerHTML = `
+        <div id="about-modal">
+          <img src="abhyasa_flyer.jpeg" alt="AbhyaSa flyer">
+          <div class="about-modal-footer">
+            <span class="about-version" id="about-version"></span>
+            <button onclick="document.getElementById('about-modal-overlay').classList.remove('open')">Close</button>
+          </div>
+        </div>
+      `;
+      overlay.addEventListener('click', e => {
+        if (e.target === overlay) overlay.classList.remove('open');
+      });
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') document.getElementById('about-modal-overlay')?.classList.remove('open');
+      });
+      
+      document.body.appendChild(overlay);
+
+      // Read version live from sw.js
+      try {
+        const swText = await fetch('sw.js').then(r => r.text());
+        const match  = swText.match(/CACHE_VERSION\s*=\s*['"]([^'"]+)['"]/);
+        if (match) document.getElementById('about-version').textContent = match[1];
+      } catch(e) { /* non-critical */ }
+    }
+
+    document.getElementById('about-modal-overlay').classList.add('open');
+  }
   // ── User menu ──────────────────────────────────────────────────────────────
   function toggleUserMenu() {
     const trigger  = document.getElementById('user-menu-trigger');
