@@ -131,6 +131,34 @@
       if (document.visibilityState === 'visible') recheckSubscription();
     });
 
+    // ── Idle timeout — sign out after 10 minutes of inactivity ────────────
+    // "Activity" = any touch, click, keypress, scroll, or mouse move.
+    // The timer resets on every activity event. When it fires, Supabase
+    // session is cleared and the user is sent back to index.html.
+    const IDLE_MS = 10 * 60 * 1000; // 10 minutes
+    let idleTimer;
+
+    async function handleIdleTimeout() {
+      try { await sb.auth.signOut(); } catch(e) { /* ignore */ }
+      window.location.href = 'index.html?reason=idle';
+    }
+
+    function resetIdleTimer() {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(handleIdleTimeout, IDLE_MS);
+    }
+
+    // Start the timer immediately and reset on any user interaction
+    ['mousemove', 'mousedown', 'keydown', 'touchstart', 'touchmove', 'scroll', 'click']
+      .forEach(evt => document.addEventListener(evt, resetIdleTimer, { passive: true }));
+
+    // Also reset when the tab becomes visible again (user switching back)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') resetIdleTimer();
+    });
+
+    resetIdleTimer(); // kick off on load
+
   })();
 </script>
 

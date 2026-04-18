@@ -618,7 +618,11 @@ function injectScoringUI() {
       max-width: 520px; width: 92%;
       box-shadow: 0 8px 40px rgba(0,0,0,0.25); position: relative;
     }
-    .sc-modal h3 { margin: 0 0 18px; font-size: 17px; color: #2c2416; }
+    .sc-modal-header {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      margin: 0 0 18px;
+    }
+    .sc-modal h3 { margin: 0; font-size: 17px; color: #2c2416; flex: 1; }
     .sc-score-row { display: flex; align-items: center; margin-bottom: 12px; gap: 10px; }
     .sc-score-label { flex: 0 0 130px; font-size: 13px; color: #555; }
     .sc-score-bar-wrap { flex: 1; background: #eee; border-radius: 4px; height: 10px; overflow: hidden; }
@@ -631,8 +635,9 @@ function injectScoringUI() {
     .sc-total-label { font-size: 15px; font-weight: 700; flex: 0 0 130px; }
     .sc-total-val   { font-size: 22px; font-weight: 700; color: #8b2e0f; margin-left: auto; }
     .sc-modal-close {
-      position: absolute; top: 12px; right: 14px;
+      flex-shrink: 0; margin-left: 12px; margin-top: -2px;
       background: none; border: none; font-size: 20px; cursor: pointer; color: #888;
+      line-height: 1; padding: 0;
     }
     .sc-meta { font-size: 11.5px; color: #888; margin-bottom: 16px; line-height: 1.6; }
     #sc-history-modal .sc-modal { max-width: 780px; }
@@ -690,16 +695,20 @@ function injectScoringUI() {
   document.body.insertAdjacentHTML('beforeend', `
     <div class="sc-modal-overlay" id="sc-score-modal">
       <div class="sc-modal">
-        <button class="sc-modal-close" onclick="document.getElementById('sc-score-modal').classList.remove('show')">✕</button>
-        <h3>Session Complete</h3>
+        <div class="sc-modal-header">
+          <h3>Session Complete</h3>
+          <button class="sc-modal-close" onclick="document.getElementById('sc-score-modal').classList.remove('show')">✕</button>
+        </div>
         <div id="sc-score-content"></div>
       </div>
     </div>
 
     <div class="sc-modal-overlay" id="sc-history-modal">
       <div class="sc-modal" style="overflow-x:auto">
-        <button class="sc-modal-close" onclick="document.getElementById('sc-history-modal').classList.remove('show')">✕</button>
-        <h3>Practice History (last ${SC_MAX_SESSIONS} sessions)</h3>
+        <div class="sc-modal-header">
+          <h3>Practice History (last ${SC_MAX_SESSIONS} sessions)</h3>
+          <button class="sc-modal-close" onclick="document.getElementById('sc-history-modal').classList.remove('show')">✕</button>
+        </div>
         <div style="overflow-y:auto; max-height:60vh">
         <table>
           <thead><tr>
