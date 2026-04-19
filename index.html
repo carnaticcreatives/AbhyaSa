@@ -14,7 +14,7 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Source+Sans+3:wght@300;400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Source+Sans+3:wght@300;400;600&family=Fira+Sans:wght@700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -199,25 +199,20 @@
           <ellipse cx="60" cy="330" rx="12" ry="8" fill="#7a3010" opacity="0.5"/>
         </g>
 
-        <!-- Brand name — large, readable -->
-        <text x="88" y="76" font-family="Georgia, serif" font-size="62" font-weight="700" fill="#ffffff" letter-spacing="-1">Abhy<tspan fill="#f5d090">a</tspan>Sa</text>
+        <!-- Rule above brand name (flyer style) — width matches AbhyaSa text -->
+        <line x1="88" y1="20" x2="318" y2="20" stroke="rgba(255,255,255,0.55)" stroke-width="2"/>
 
-        <!-- Thin rule under brand name -->
-        <line x1="88" y1="88" x2="412" y2="88" stroke="rgba(255,255,255,0.3)" stroke-width="0.8"/>
+        <!-- Brand name — large, readable — Fira Sans matching flyer -->
+        <text x="88" y="76" font-family="'Fira Sans', 'Arial', sans-serif" font-size="62" font-weight="700" fill="#ffffff" letter-spacing="-1">abhya<tspan fill="#f5d090">Sa</tspan></text>
+        
+        <!-- Rule below brand name (flyer style) — width matches AbhyaSa text -->
+        <line x1="88" y1="84" x2="318" y2="84" stroke="rgba(255,255,255,0.50)" stroke-width="2"/>
 
         <!-- Tagline -->
         <text x="90" y="112" font-family="Georgia, serif" font-size="16" font-style="italic" fill="rgba(255,255,255,0.85)">An aid to structured Carnatic music practice</text>
 
-        <!-- Bottom rule -->
-        <line x1="90" y1="128" x2="412" y2="128" stroke="rgba(255,255,255,0.15)" stroke-width="0.8"/>
-
         <!-- Attribution -->
         <text x="412" y="145" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="rgba(255,255,255,0.4)" letter-spacing="0.5">by CARNATIC CREATIVES</text>
-
-        <!-- Decorative swara dots -->
-        <circle cx="92" cy="140" r="2" fill="rgba(255,255,255,0.35)"/>
-        <circle cx="101" cy="136" r="1.5" fill="rgba(255,255,255,0.2)"/>
-        <circle cx="110" cy="140" r="2" fill="rgba(255,255,255,0.35)"/>
       </svg>
     </div>
 

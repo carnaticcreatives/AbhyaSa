@@ -6,6 +6,9 @@
 <title>CARNATIC CREATIVES AbhyaSa</title>
 <link rel="icon" href="icon-512.png">
 <link rel="stylesheet" href="styles.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@700&display=swap" rel="stylesheet">
 
 <!-- ── SESSION GUARD — must be first script, blocks everything else ───────
      Checks Supabase session + active subscription before the app loads.
@@ -279,12 +282,13 @@
     padding-top: 6px;
   }
   #about-modal-overlay.open { display: flex; }
-  #about-modal {
+   #about-modal {
     background: #fff; border-radius: 4px;
     max-width: 400px; width: 96%; max-height: 96vh;
     overflow: hidden;
     box-shadow: 0 8px 40px rgba(0,0,0,0.35);
     display: flex; flex-direction: column;
+    position: relative;
   }
   #about-modal img {
     width: 100%; display: block;
@@ -307,6 +311,40 @@
   }
   .about-modal-footer button:hover { background: #6e2409; }
   
+  /* ── Pricing modal ───────────────────────────────────────────────────── */
+  #pricing-modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6); z-index: 9500;
+    align-items: flex-start; justify-content: center;
+    padding-top: 6px;
+  }
+  #pricing-modal-overlay.open { display: flex; }
+  #pricing-modal-overlay #about-modal {
+    background: #fff; border-radius: 4px;
+    max-width: 400px; width: 96%; max-height: 96vh;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.35);
+    display: flex; flex-direction: column;
+  }
+  #pricing-modal-overlay img {
+    width: 100%; display: block;
+    min-height: 0; flex: 1 1 auto;
+    object-fit: contain; object-position: top;
+  }
+
+  /* ── Modal close X button ────────────────────────────────────────────── */
+  .modal-close-x {
+    position: absolute;
+    top: 6px; right: 8px;
+    background: none; border: none;
+    color: rgba(255,255,255,0.85);
+    font-size: 20px; line-height: 1;
+    cursor: pointer; padding: 0;
+    width: auto;
+    z-index: 10;
+  }
+  .modal-close-x:hover { color: #fff; }
+
   /* ── Expiry warning bar ──────────────────────────────────────────────── */
   #expiry-warning {
     display: none;
@@ -397,12 +435,20 @@
     </div>
     
     <div class="udrop-divider"></div>
-    <!-- 5. Sign out -->
+    <!-- 5. Pricing Plan -->
+    <div class="udrop-item" onclick="closeUserMenu(); showPricing()">
+      <span class="ud-icon">💰</span> Pricing Plan
+    </div>
+    
+    <div class="udrop-divider"></div>
+    <!-- 6. Sign out -->
     <div class="udrop-item" onclick="doLogout()">
       <span class="ud-icon">🚪</span> Sign out
     </div>
   </div>
 </div>
+
+
 
 <!-- Expiry warning bar — shown when subscription is within 30 days of expiry -->
 <div id="expiry-warning">
@@ -430,14 +476,20 @@
       <line x1="68" y1="281" x2="80" y2="40" stroke="#f0d080" stroke-width="1.5" fill="none"/>
     </g>
 
-    <!-- Brand name -->
-    <text x="12" y="19" font-family="Georgia, serif" font-size="18" font-weight="700" fill="#ffffff" letter-spacing="-0.5">Abhy<tspan fill="#f5d090">a</tspan>Sa</text>
+    <!-- Rule above brand name (flyer style) — width matches AbhyaSa text -->
+    <line x1="12" y1="3" x2="80" y2="3" stroke="rgba(255,255,255,0.55)" stroke-width="1"/>
+
+    <!-- Brand name — Fira Sans matching flyer -->
+    <text x="12" y="19" font-family="'Fira Sans', 'Arial', sans-serif" font-size="18" font-weight="700" fill="#ffffff" letter-spacing="-0.5">abhya<tspan fill="#f5d090">Sa</tspan></text>
+
+    <!-- Rule below brand name (flyer style) — width matches AbhyaSa text -->
+    <line x1="12" y1="23" x2="80" y2="23" stroke="rgba(255,255,255,0.50)" stroke-width="1"/>
 
     <!-- Vertical divider -->
-    <line x1="110" y1="4" x2="110" y2="22" stroke="rgba(255,255,255,0.3)" stroke-width="0.8"/>
+    <line x1="97" y1="4" x2="97" y2="22" stroke="rgba(255,255,255,0.3)" stroke-width="0.8"/>
 
     <!-- Tagline -->
-    <text x="118" y="18" font-family="Georgia, serif" font-size="10" font-style="italic" fill="rgba(255,255,255,0.75)">An aid to structured Carnatic music practice</text>
+    <text x="105" y="18" font-family="Georgia, serif" font-size="10" font-style="italic" fill="rgba(255,255,255,0.75)">An aid to structured Carnatic music practice</text>
 
     <!-- Attribution -->
     <text x="415" y="24" text-anchor="end" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.3)">by CARNATIC CREATIVES</text>
@@ -547,11 +599,8 @@
       overlay.id = 'about-modal-overlay';
       overlay.innerHTML = `
         <div id="about-modal">
-          <img src="abhyasa_flyer.jpeg" alt="AbhyaSa flyer">
-          <div class="about-modal-footer">
-            <span class="about-version" id="about-version"></span>
-            <button onclick="document.getElementById('about-modal-overlay').classList.remove('open')">Close</button>
-          </div>
+          <button class="modal-close-x" onclick="document.getElementById('about-modal-overlay').classList.remove('open')">✕</button>
+          <img src="abhyasa_flyer.png" alt="AbhyaSa flyer">
         </div>
       `;
       overlay.addEventListener('click', e => {
@@ -573,6 +622,29 @@
 
     document.getElementById('about-modal-overlay').classList.add('open');
   }
+
+  // ── Pricing modal ───────────────────────────────────────────────────────────
+  function showPricing() {
+    if (!document.getElementById('pricing-modal-overlay')) {
+      const overlay = document.createElement('div');
+      overlay.id = 'pricing-modal-overlay';
+      overlay.innerHTML = `
+        <div id="about-modal">
+          <button class="modal-close-x" onclick="document.getElementById('pricing-modal-overlay').classList.remove('open')">✕</button>
+          <img src="abhyasa_pricing.png" alt="AbhyaSa Pricing Plan">
+        </div>
+      `;
+      overlay.addEventListener('click', e => {
+        if (e.target === overlay) overlay.classList.remove('open');
+      });
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') document.getElementById('pricing-modal-overlay')?.classList.remove('open');
+      });
+      document.body.appendChild(overlay);
+    }
+    document.getElementById('pricing-modal-overlay').classList.add('open');
+  }
+  
   // ── User menu ──────────────────────────────────────────────────────────────
   function toggleUserMenu() {
     const trigger  = document.getElementById('user-menu-trigger');
