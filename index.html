@@ -453,20 +453,15 @@
     });
     if (error) {
       setLoading('btn-signup', false);
-      showMsg('msg-signup', 'error', error.message || 'Signup failed. Please try again.');
+      showMsg('msg-signup', 'error', error.message || 'Signup failed.');
       return;
     }
 
     const userId = data.user && data.user.id;
-    // Use the session token returned directly from signUp — don't call getSession()
     const token  = data.session && data.session.access_token;
 
-    // ── Step 2: Create the profile row ──────────────────────────────────────
-    if (userId) {
-      await sb.from('profiles').insert({
-        id: userId, full_name: name, email: email, role: 'student'
-      });
-    }
+// Profile is now created automatically by the database trigger ✅
+// Go straight to coupon activation...Step 2 removed
 
     // ── Step 3: Activate coupon via Edge Function ────────────────────────────
     if (coupon && userId) {
