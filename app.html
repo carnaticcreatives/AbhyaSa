@@ -48,18 +48,30 @@
       return;
     }
 
-    // 3. Auth passed — expose user info to the app and show the page
-    const userName = session.user.user_metadata?.full_name || session.user.email;
+    // 3. Auth passed — fetch profile and expose user info
+    let userName = session.user.email; // fallback
+    let defaultSruti = null;
+
+    const { data: profile, error: profileError } = await sb
+      .from('profiles')
+      .select('full_name, Sruthi')
+      .eq('id', session.user.id)
+      .maybeSingle();
+
+    if (profile?.full_name) userName = profile.full_name;
+    if (profile?.Sruthi) defaultSruti = profile.Sruthi;
+
     window.__appUser = {
       id:          session.user.id,
       email:       session.user.email,
       name:        userName,
       expiryDate:  sub.expiry_date,
+      defaultSruti: defaultSruti,
       supabase:    sb
     };
 
     // Populate menu fields before page becomes visible
-    document.getElementById('bar-name').textContent   = userName;
+    document.getElementById('bar-name').textContent    = userName;
     document.getElementById('ud-fullname').textContent = userName;
     document.getElementById('ud-email').textContent    = session.user.email;
 
@@ -91,7 +103,7 @@
         const udSruti = document.getElementById('ud-default-sruti-select');
         if (srutiEl) srutiEl.value = savedSruti;
         if (udSruti) udSruti.value = savedSruti;
-        console.log('[Sruti] Default applied:', savedSruti);
+        
       }
     }
 
