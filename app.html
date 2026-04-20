@@ -624,24 +624,40 @@
   }
 
   // ── Pricing modal ───────────────────────────────────────────────────────────
-  function showPricing() {
-    if (!document.getElementById('pricing-modal-overlay')) {
-      const overlay = document.createElement('div');
-      overlay.id = 'pricing-modal-overlay';
-      overlay.innerHTML = `
-        <div id="about-modal">
-          <button class="modal-close-x" onclick="document.getElementById('pricing-modal-overlay').classList.remove('open')">✕</button>
-          <img src="abhyasa_pricing.png" alt="AbhyaSa Pricing Plan">
-        </div>
-      `;
-      overlay.addEventListener('click', e => {
-        if (e.target === overlay) overlay.classList.remove('open');
-      });
-      document.addEventListener('keydown', e => {
-        if (e.key === 'Escape') document.getElementById('pricing-modal-overlay')?.classList.remove('open');
-      });
-      document.body.appendChild(overlay);
+  async function showPricing() {
+    // Always remove old overlay so country detection runs fresh
+    const existing = document.getElementById('pricing-modal-overlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'pricing-modal-overlay';
+
+    // Detect country via IP
+    let isIndia = true;
+    try {
+      const res = await fetch('https://ipapi.co/json/');
+      const data = await res.json();
+      isIndia = data.country_code === 'IN';
+    } catch (e) {
+      isIndia = true;
     }
+
+    overlay.innerHTML = `
+      <div id="about-modal">
+        <button class="modal-close-x" onclick="document.getElementById('pricing-modal-overlay').classList.remove('open')">✕</button>
+        ${isIndia
+          ? `<img src="abhyasa_pricing_INR.png" alt="AbhyaSa Pricing Plan">`
+          : `<img src="abhyasa_pricing_USD.png" alt="AbhyaSa Pricing Plan">`
+        }
+      </div>
+    `;
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay) overlay.classList.remove('open');
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') document.getElementById('pricing-modal-overlay')?.classList.remove('open');
+    });
+    document.body.appendChild(overlay);
     document.getElementById('pricing-modal-overlay').classList.add('open');
   }
   
