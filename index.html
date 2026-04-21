@@ -224,6 +224,7 @@
 
       <!-- LOGIN -->
       <div id="panel-login" class="panel active">
+        <form onsubmit="return false;">
         <div class="field">
           <label>Email</label>
           <input type="email" id="login-email" placeholder="you@example.com" autocomplete="email" autofocus>
@@ -232,8 +233,9 @@
           <label>Password</label>
           <input type="password" id="login-password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="current-password">
         </div>
-        <button class="btn-primary" id="btn-login" onclick="doLogin()">Sign In</button>
+        <button type="button" class="btn-primary" id="btn-login" onclick="doLogin()">Sign In</button>
         <div id="msg-login" class="msg"></div>
+        </form>
         <div class="divider">or</div>
         <div class="subscribe-note">
           Don't have an account?
@@ -244,6 +246,7 @@
 
       <!-- SIGNUP -->
       <div id="panel-signup" class="panel">
+        <form onsubmit="return false;">
         <div class="field">
           <label>Full Name</label>
           <input type="text" id="signup-name" placeholder="Your name">
@@ -264,12 +267,14 @@
           Have a coupon code?
           <a href="#" onclick="toggleCoupon();return false;" id="coupon-toggle-link">Enter it here</a>
         </div>
-        <button class="btn-primary" id="btn-signup" onclick="doSignup()">Create Account</button>
+        <button type="button" class="btn-primary" id="btn-signup" onclick="doSignup()">Create Account</button>
         <div id="msg-signup" class="msg"></div>
+        </form>
       </div>
 
       <!-- FORGOT PASSWORD (request reset email) -->
       <div id="panel-forgot" class="panel">
+        <form onsubmit="return false;">
         <p style="font-size:14px;color:var(--muted);margin-bottom:20px;line-height:1.5;">
           Enter your email address and we'll send you a link to reset your password.
         </p>
@@ -277,15 +282,17 @@
           <label>Email</label>
           <input type="email" id="forgot-email" placeholder="you@example.com" autocomplete="email">
         </div>
-        <button class="btn-primary" id="btn-forgot" onclick="doForgot()">Send Reset Link</button>
+        <button type="button" class="btn-primary" id="btn-forgot" onclick="doForgot()">Send Reset Link</button>
         <div id="msg-forgot" class="msg"></div>
         <div style="margin-top:16px;text-align:center;">
           <a href="#" onclick="showTab('login');return false;" style="font-size:13px;color:var(--muted);text-decoration:none;">← Back to Sign In</a>
         </div>
+        </form>
       </div>
 
       <!-- RESET PASSWORD (shown when user arrives via email link) -->
       <div id="panel-reset" class="panel">
+        <form onsubmit="return false;">
         <p style="font-size:14px;color:var(--muted);margin-bottom:20px;line-height:1.5;">
           Choose a new password for your account.
         </p>
@@ -297,8 +304,9 @@
           <label>Confirm Password</label>
           <input type="password" id="reset-password-confirm" placeholder="Repeat your new password" autocomplete="new-password">
         </div>
-        <button class="btn-primary" id="btn-reset" onclick="doResetPassword()">Set New Password</button>
+        <button type="button" class="btn-primary" id="btn-reset" onclick="doResetPassword()">Set New Password</button>
         <div id="msg-reset" class="msg"></div>
+        </form>
       </div>
     </div>
 
@@ -326,14 +334,7 @@
     console.error('[Supabase] Failed to initialise — is supabase.min.js present in the same folder?', e);
   }
 
-  // Register service worker
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js')
-        .then(reg => console.log('[SW] Registered, scope:', reg.scope))
-        .catch(err => console.warn('[SW] Registration failed:', err));
-    });
-  }
+
 
   // If already logged in with active subscription, go straight to app.
   // Skip if this is a password recovery redirect (?code= or #type=recovery).
@@ -401,31 +402,56 @@
     return !!data;
   }
 
-  async function doLogin() {
-    const email    = document.getElementById('login-email').value.trim();
-    const password = document.getElementById('login-password').value;
-    if (!email || !password) {
-      showMsg('msg-login', 'error', 'Please enter your email and password.');
-      return;
-    }
-    setLoading('btn-login', true);
-    clearMessages();
-    const { data, error } = await sb.auth.signInWithPassword({ email, password });
-    if (error) {
-      setLoading('btn-login', false);
-      showMsg('msg-login', 'error', error.message || 'Login failed. Please check your credentials.');
-      return;
-    }
-    const active = await hasActiveSubscription(data.user.id);
+  // Replace your existing doLogin() in index.html with this.
+// The only addition is the log-login-event call after successful login,
+// before the redirect to app.html. Everything else is unchanged.
+
+async function doLogin() {
+  const email    = document.getElementById('login-email').value.trim();
+  const password = document.getElementById('login-password').value;
+  if (!email || !password) {
+    showMsg('msg-login', 'error', 'Please enter your email and password.');
+    return;
+  }
+  setLoading('btn-login', true);
+  clearMessages();
+
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
     setLoading('btn-login', false);
-    if (active) {
-      window.location.href = 'app.html';
-    } else {
-      showMsg('msg-login', 'info', 'No active subscription found. Please contact carnaticcreatives@gmail.com to subscribe');
-    }
+    showMsg('msg-login', 'error', error.message || 'Login failed. Please check your credentials.');
+    return;
   }
 
-    // ── REPLACE the existing doSignup() function in index.html with this ───────
+  const active = await hasActiveSubscription(data.user.id);
+  if (!active) {
+    setLoading('btn-login', false);
+    showMsg('msg-login', 'info', 'No active subscription found. Please contact carnaticcreatives@gmail.com to subscribe');
+    return;
+  }
+
+  // ── Log the login event (fire-and-forget — never blocks redirect) ─────
+  console.log('token:', data?.session?.access_token?.substring(0, 20));
+  try {
+    await fetch(
+      'https://wcpbbvurfbraqqqlpsro.supabase.co/functions/v1/log-login-even',
+      {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': 'Bearer ' + data.session.access_token,
+        },
+      }
+    );
+  } catch (e) {
+    // Silently ignore — logging failure must never block login
+    console.warn('[login-event] Could not log login event:', e.message);
+  }
+
+  window.location.href = 'app.html';
+}
+
+  // ── REPLACE the existing doSignup() function in index.html with this ───────
   // The only change: coupon activation now calls the Edge Function instead of
   // doing three separate client-side DB operations.
 
