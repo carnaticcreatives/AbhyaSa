@@ -431,7 +431,7 @@ async function doLogin() {
   }
 
   // ── Log the login event (fire-and-forget — never blocks redirect) ─────
-  console.log('token:', data?.session?.access_token?.substring(0, 20));
+  
   try {
     await fetch(
       'https://wcpbbvurfbraqqqlpsro.supabase.co/functions/v1/log-login-even',
