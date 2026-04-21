@@ -1,0 +1,2 @@
+[functions.log-login-even]
+verify_jwt = false
