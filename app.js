@@ -507,7 +507,7 @@ function displayFullPattern(label, patternGroup) {
 
   if (
     (ragaType === "audava" || ragaType === "shadava") &&
-    varisaiSelect.value === "Alankaram"
+    (varisaiSelect.value === "Alankaram" || varisaiSelect.value === "Alankaram-Tisram")
   ) {
 
     if (ragaType === "audava") {
@@ -864,7 +864,7 @@ if (!skipVarisai) {
   }));
 
   // If this is an Alankaram session, store the talam names for display
-  if (varisaiSelect.value === 'Alankaram' && efResponse.alankaramMeta) {
+  if (['Alankaram','Alankaram-Tisram'].includes(varisaiSelect.value) && efResponse.alankaramMeta) {
     window._alankaramNamesLive = efResponse.alankaramMeta.names;
   } else {
     window._alankaramNamesLive = null;
@@ -898,6 +898,7 @@ if (!skipVarisai) {
 
   /* === PLAYBACK LOOP === */
   let lastPatternId = null;
+  let lastBpm = null;  // track speed-tier changes for metronomeBeatAccum reset
 
   for (; currentQueueIndex < playQueueGlobal.length; currentQueueIndex++) {
 
@@ -916,6 +917,7 @@ if (skipRequested === "FORWARD") {
   const nextPidStart = findNextPatternIndex(playedIndex);
   currentQueueIndex = nextPidStart - 1; // -1 because for-loop continue will ++ again
   lastPatternId = null;
+  lastBpm = null;
   continue;
 }
 
@@ -928,6 +930,7 @@ if (skipRequested === "BACKWARD") {
     : currentStart;
   currentQueueIndex = target - 1; // -1 because for-loop continue will ++ again
   lastPatternId = null;
+  lastBpm = null;
   continue;
 }
 
@@ -938,7 +941,7 @@ if (skipRequested === "BACKWARD") {
     // Determine the talam for this item
     let newTalamKey = "adi";
     let title = `${item.label} (Pattern ${item.pid})`;
-    if (varisaiSelect.value === "Alankaram") {
+    if (varisaiSelect.value === "Alankaram" || varisaiSelect.value === "Alankaram-Tisram") {
       const tala = (window._alankaramNamesLive || {})[item.pid];
       if (tala) {
         title =
@@ -948,17 +951,25 @@ if (skipRequested === "BACKWARD") {
       newTalamKey = ALANKARAM_TALAM_MAP[item.pid] || "adi";
     }
 
-    // Reset metronome whenever the pattern (pid) changes — this covers both
-    // natural pattern-to-pattern transitions AND skip forward/backward.
-    // Within a single pattern (1st/2nd/3rd speed + repeat) the beat flows on uninterrupted.
+    // Always keep currentTalamKey in sync with the current item.
+    // For Alankaram, each pid maps to a different talam — this must be set
+    // on every queue item so it is never stale when scheduleMetronomeClick fires.
+    currentTalamKey = newTalamKey;
+
+    // Reset beat counters and rebuild dots when pid changes (new alankaram pattern).
+    // Also reset metronomeBeatAccum when bpm changes (speed tier changes: 1st→2nd→Tisram→3rd)
+    // so the click grid stays aligned across lines within each speed tier.
     const pidChanged = (item.pid !== lastPatternId);
+    const bpmChanged = (item.bpm !== lastBpm);
     if (pidChanged) {
-      currentTalamKey = newTalamKey;
       metronomeBeat = 0;
       metronomeBeatAccum = 0;
       if (isMetronomeEnabled()) buildBeatDots();
+    } else if (bpmChanged) {
+      metronomeBeatAccum = 0;
     }
     lastPatternId = item.pid;
+    lastBpm = item.bpm;
 
     if (isMetronomeEnabled()) {
       const display = document.getElementById('metronomeBeatDisplay');
@@ -982,14 +993,15 @@ if (skipRequested === "BACKWARD") {
         if (
           ragaType === "audava" &&
           (varisaiSelect.value === "Sarali Varisai" ||
-          varisaiSelect.value === "Alankaram")
+          varisaiSelect.value === "Alankaram" ||
+          varisaiSelect.value === "Alankaram-Tisram")
         ) {
           lineToPlay = resolveAudavaPattern(line, ragamNotes);
         }
         
         if (
           ragaType === "shadava" &&
-          (varisaiSelect.value === "Alankaram")
+          (varisaiSelect.value === "Alankaram" || varisaiSelect.value === "Alankaram-Tisram")
         ) {
           lineToPlay = resolveAudavaPattern(line, ragamNotes);
         }
@@ -1204,7 +1216,7 @@ function isMetronomeEnabled() {
 }
 
 function isAlankaramSelected() {
-  return document.getElementById('varisai')?.value === 'Alankaram';
+  const v = document.getElementById('varisai')?.value; return v === 'Alankaram' || v === 'Alankaram-Tisram';
 }
 
 // Show/hide beat dots when checkbox changes
