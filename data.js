@@ -63,7 +63,8 @@ const VARISAI_ALL = [
   "Dhatu Varisai",
   "Hechusthayi Varisai",
   "Mandrasthayi Varisai",
-  "Alankaram"
+  "Alankaram",
+  "Alankaram-Tisram"
 ];
 
 // Audava and Shadava ragams have irregular note counts (5 and 6 notes),
@@ -71,11 +72,13 @@ const VARISAI_ALL = [
 // Only Alankaram is offered — by design, not omission.
 const VARISAI_AUDAVA = [
   "Alankaram",
+  "Alankaram-Tisram",
 ];
 
 // Same rationale as VARISAI_AUDAVA — 6-note scales only support Alankaram.
 const VARISAI_SHADAVA = [
-  "Alankaram"
+  "Alankaram",
+  "Alankaram-Tisram"
 ];
 
 function loadVarisais(list) {
