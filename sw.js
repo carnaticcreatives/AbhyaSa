@@ -2,7 +2,7 @@
 // !! BUMP CACHE_VERSION ON EVERY DEPLOY !!
 // Change the string below (e.g. cmp-v68) before pushing to GitHub.
 // The browser detects the change and installs the updated worker automatically.
-const CACHE_VERSION = 'AbhyaSa-v3.0';
+const CACHE_VERSION = 'AbhyaSa-v4.0';
 
 // Files to cache on install — these are served instantly from cache
 // even on slow connections. cmpasset01.ogg is included so Tanpura

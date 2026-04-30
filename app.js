@@ -1,4 +1,3 @@
-
 /* ── Runtime ragam dicts populated from Supabase ──────────────────────────
    These start as the inline hardcoded dicts (fallback).
    ragamInit() replaces them with Supabase data once the user is logged in. */
@@ -148,7 +147,7 @@ document.querySelectorAll("input[name=ragaType]").forEach(r => {
 
     if (r.value === "sampoorna" && r.checked) {
       loadSampoornaRagams();
-      loadVarisais(VARISAI_ALL);
+      loadVarisais(currentVarisaiList());
     }
 
     if (r.value === "shadava" && r.checked) {
@@ -167,11 +166,30 @@ document.querySelectorAll("input[name=ragaType]").forEach(r => {
   };
 });
 
+// Returns the correct varisai list based on current Variety selection.
+// Tisram singing uses VARISAI_ALL (no Alankaram-Tisram — that's a separate path).
+// All other varieties use VARISAI_ALL_WITH_TISRAM (includes Alankaram-Tisram option).
+function currentVarisaiList() {
+  return getVariety() === 'tisram' ? VARISAI_ALL : VARISAI_ALL_WITH_TISRAM;
+}
+
+// VARISAI_ALL_WITH_TISRAM — full list including Alankaram-Tisram option.
+// Shown when Tisram singing variety is NOT active.
+const VARISAI_ALL_WITH_TISRAM = [
+  "Sarali Varisai",
+  "Janta Varisai",
+  "Dhatu Varisai",
+  "Hechusthayi Varisai",
+  "Mandrasthayi Varisai",
+  "Alankaram",
+  "Alankaram-Tisram"
+];
+
 /* INITIAL LOAD — all ragam data comes from Supabase via ragamInit() */
 (async function initApp() {
   // Don't call loadSampoornaRagams() here — melakarta_dict is empty until ragamInit()
   // ragamInit() calls loadSampoornaRagams() after loading from Supabase
-  loadVarisais(VARISAI_ALL);
+  loadVarisais(VARISAI_ALL_WITH_TISRAM);
 })();
 
 /** Called from app.html session guard after __appUser is confirmed.
@@ -213,6 +231,18 @@ let isPlaying = false;
 let skipRequested = false;
 let playQueueGlobal = [];
 let currentQueueIndex = 0;
+
+// Incremented every time a new play session starts.
+// playPattern captures this at call time; after its sleep it checks whether
+// the session ID has changed (Stop+Play while sleeping) and bails out.
+let playSessionId = 0;
+
+// Mutex: prevents a second playSelected() from entering during the async
+// getSession() + edge-function fetch window of the first call.
+// Without this, Stop+Play faster than ~300 ms can launch two concurrent
+// playback loops that both pass the isPlaying guard and schedule notes
+// simultaneously — the root cause of overlay at 60/80 BPM.
+let _playLock = false;
 
 
 /***********************
@@ -420,8 +450,8 @@ function resolveFrequency(note, ragamNotes, srutiFactor, isOwnNotes) {
 /***********************
  * NOTE SYNTH
  ***********************/
-function playPiano(freq, dur, startTime) {
-  const ctx = getAudioCtx();
+function playPiano(freq, dur, startTime, ctx) {
+  if (!ctx) ctx = getAudioCtx();  // fallback for any direct callers
 
   const gain = ctx.createGain();
   gain.connect(masterGain);
@@ -451,8 +481,19 @@ function playPiano(freq, dur, startTime) {
   osc1.start(startTime);
   osc2.start(startTime);
 
-  osc1.stop(startTime + dur + 0.2);
-  osc2.stop(startTime + dur + 0.2);
+  const stopTime = startTime + dur + 0.2;
+  osc1.stop(stopTime);
+  osc2.stop(stopTime);
+
+  // CRITICAL: disconnect gain from masterGain as soon as oscillators finish.
+  // Without this, when a skip zeroes masterGain and the next pattern immediately
+  // restores it to 0.9, any still-running oscillators from the previous pattern
+  // (which haven't hit their .stop() time yet) are suddenly re-amplified through
+  // masterGain and become audible again — causing the overlap.
+  // onended fires when the last oscillator in this note's graph stops.
+  osc2.onended = () => {
+    try { gain.disconnect(); } catch (_) {}
+  };
 }
 
 // Display full pattern
@@ -541,13 +582,18 @@ function displayFullPattern(label, patternGroup) {
 function skipForward() {
   if (!isPlaying) return;
   skipRequested = "FORWARD";
-  hardStopAllAudio(); 
+  // Destroy the AudioContext entirely. silenceAllAudioInstantly() only zeroes
+  // masterGain — but the old scheduled oscillators stay alive and reconnect
+  // when masterGain is restored for the next pattern, causing overlap.
+  // hardStopAllAudio() closes the context, permanently killing all scheduled notes.
+  // The playback loop recreates a fresh context for the next pattern via getAudioCtx().
+  hardStopAllAudio();
 }
 
 function skipBackward() {
   if (!isPlaying) return;
   skipRequested = "BACKWARD";
-  hardStopAllAudio(); 
+  hardStopAllAudio();
 }
 
 function clearDisplay() {
@@ -560,7 +606,9 @@ function togglePlay() {
   if (isPlaying) {
     isPlaying = false;
     skipRequested = false;
-    hardStopAllAudio();
+    _playLock = false;          // release lock so next Play can enter immediately
+    hardStopAllAudio();         // destroy AudioContext FIRST — kills scheduled oscillators
+    stopMetronome();            // then clean up metronome (avoids getAudioCtx() recreating ctx)
     stopTanpura();
     clearDisplay();
     // Notify scoring engine that playback stopped
@@ -621,11 +669,28 @@ function findPrevPatternIndex(fromIndex) {
  * PLAY CONTROL
  ***********************/
 async function playSelected() {
-   
-  if (isPlaying) return;
+
+  // _playLock prevents a second call from sneaking in during the async
+  // getSession() + edge-function fetch window before isPlaying is effective.
+  if (isPlaying || _playLock) return;
+  _playLock = true;
 
   isPlaying = true;
   skipRequested = false;
+  playSessionId++;                    // invalidate any sleeping playPattern from old session
+  const mySessionId = playSessionId;  // this call's session token
+
+  // Ensure AudioContext is fully awake before any scheduling begins.
+  // audioCtx.resume() returns a Promise — not awaiting it means the context
+  // may still be suspended when the first note is scheduled, causing it to
+  // drop or bunch up on resume. We call getAudioCtx() to create the context
+  // if needed, then await resume() only if it is actually suspended.
+  {
+    const _ctx = getAudioCtx();
+    if (_ctx.state === 'suspended') {
+      await _ctx.resume();
+    }
+  }
 
   const bpm = +document.querySelector("input[name=speed]:checked").value;
 
@@ -637,13 +702,29 @@ async function playSelected() {
   const ragaType =
   document.querySelector("input[name=ragaType]:checked").value;
 
-  // Tambura only mode — start drone and exit before any pattern logic
+  // Tambura only mode
   if (ragaType === "tambura") {
-    await startTanpura(srutiFactor);
-    staticInfo.innerHTML = `<b>Chosen Sruti: ${srutiKey}</b>`;
-    dynamicInfo.innerHTML = 'Sing along to align with your Sruti,then choose the Ragam Type to begin';
-    if (progressBar) progressBar.value = 0;
-    isPlaying = false;
+    const variety_t = getVariety();
+    if (variety_t === 'tala') {
+      // Tala practice with tambura drone — start both
+      await startTanpura(srutiFactor);
+      staticInfo.innerHTML = `<b>Tala + Sruti Practice</b> &nbsp;·&nbsp; ${srutiKey}`;
+      dynamicInfo.innerHTML = '';
+      isPlaying = true;
+      await practiceMode_TalamOnly(srutiFactor);
+      stopTanpura();
+      stopMetronome();
+      isPlaying = false;
+      _playLock = false;
+    } else {
+      // Pure tambura — sruti alignment only
+      await startTanpura(srutiFactor);
+      staticInfo.innerHTML = `<b>Chosen Sruti: ${srutiKey}</b>`;
+      dynamicInfo.innerHTML = 'Sing along to align with your Sruti, then choose the Ragam Type to begin';
+      if (progressBar) progressBar.value = 0;
+      isPlaying = false;
+      _playLock = false;
+    }
     return;
   }
 
@@ -693,25 +774,75 @@ let skipVarisai = false;
     scoringOnPlayStart(_rn, srutiFactor);
   }
 
+  // ── Variety / practice mode ──────────────────────────────────────────────
+  const variety          = getVariety();
+  const isTisramSinging  = (variety === 'tisram');
+  const isTalaPracticeOnly = (variety === 'tala');
+
+  // isTisram: true when "Alankaram-Tisram" is selected in the Varisai dropdown.
+  // Routes to the edge function's Alankaram-Tisram pattern set.
+  const isTisram = (varisaiSelect?.value === 'Alankaram-Tisram');
+
+  // ── Gati / talam for guided playback ─────────────────────────────────────
+  if (isTisramSinging) {
+    currentTalamKey = "triputa";
+    currentGati     = 3;    // Tisram: 3 matras per aksharam
+    currentJati     = 4;
+  } else {
+    currentTalamKey = "triputa";
+    currentGati     = 4;
+    currentJati     = 4;
+  }
+
+  // ── Practice mode ───────────────────────────────────────────────────────
+  // "guided"     = play swarams + metronome (default, also Tisram singing)
+  // "talam"      = talam-only metronome (Tala practice variety selected)
+  // Tisram singing is guided mode with gati=3 — not talam-only.
+  const practiceMode = isTalaPracticeOnly ? "talam" : "guided";
+
+  if (practiceMode === "talam") {
+    await practiceMode_TalamOnly(srutiFactor);
+    stopMetronome();
+    isPlaying = false;
+    _playLock = false;
+    return;
+  }
+
+  // Declared here so the playPattern call (outside the !skipVarisai block) can access it.
+  // Assigned inside the !skipVarisai block; stays false for janya.
+
 /* === JANYA RAGAM: ARO + AVA ONLY === */
 if (ragaType === "janya") {
 
   // Build play queue manually
-  playQueueGlobal = [
-    {
-      patternGroup: [aro],
-      bpm: bpm,
-      metronomeBpm: bpm,
-      label: "Arohanam",
-      pid: 1
-    },
-    {
-      patternGroup: [ava],
-      bpm: bpm,
-      metronomeBpm: bpm,
-      label: "Avarohanam",
-      pid: 2
+  await startTanpura(srutiFactor);
+
+  const _gamakamResult = await playJanyaWithGamakam({
+    ragamId:    selectedJanyaKey,
+    arohanam:   aro,
+    avarohanam: ava,
+    melakarta:  currentJanyaRecord.melakarta,
+    srutiFactor,
+    bpm,
+    mySessionId,
+  });
+
+  if (_gamakamResult !== null) {
+    // Aro/ava gamakam ran — if it completed normally, follow up with
+    // the ragam's signature (pidi) phrases stored in ragams.swaras.
+    if (_gamakamResult === "DONE" && isPlaying && mySessionId === playSessionId) {
+      await playSignaturePhrases(selectedJanyaKey, srutiFactor, bpm, mySessionId);
     }
+    // Clean up regardless of whether phrases ran or were skipped/stopped
+    stopTanpura();
+    isPlaying = false;
+    _playLock = false;
+    return;
+  }
+  // null = edge function unreachable — fall through to original plain aro/ava below
+  playQueueGlobal = [
+    { patternGroup: [aro], bpm: bpm, metronomeBpm: bpm, label: "Arohanam",   pid: 1 },
+    { patternGroup: [ava], bpm: bpm, metronomeBpm: bpm, label: "Avarohanam", pid: 2 }
   ];
 
 // Derive Melakarta from the fetched record
@@ -758,8 +889,13 @@ if (!skipVarisai) {
   staticInfo.innerHTML =
     `<b>Ragam:</b> ${ragamName} | ` +
     `<b>Arohanam:</b> ${aro} | ` +
-    `<b>Avarohanam:</b> ${ava}`;
+    `<b>Avarohanam:</b> ${ava}` +
+    (isTisramSinging ? ` | <b style="color:#7a3c00">Tisram Singing</b>` : '');
 }
+
+// isTisramNonAlankaram declared here (not inside !skipVarisai) so the playback
+// loop can read it. Assigned inside !skipVarisai; stays false for janya path.
+let isTisramNonAlankaram = false;
 
 if (!skipVarisai) {
   /* === FETCH PLAY QUEUE FROM EDGE FUNCTION === */
@@ -768,6 +904,7 @@ if (!skipVarisai) {
     console.error('[Patterns] Supabase not available');
     stopTanpura();
     isPlaying = false;
+    _playLock = false;
     return;
   }
 
@@ -780,15 +917,27 @@ if (!skipVarisai) {
     const { data: sessData } = await sb.auth.getSession();
     const _sess = sessData?.session;
 
+    // Guard: Stop+Play while getSession was awaiting
+    if (mySessionId !== playSessionId) { stopTanpura(); _playLock = false; return; }
+
     if (!_sess?.access_token) {
       stopTanpura();
       isPlaying = false;
+      _playLock = false;
       window.location.href = 'index.html';
       return;
     }
 
     const efUrl = 'https://wcpbbvurfbraqqqlpsro.supabase.co/functions/v1/get-patterns';
     const ANON_KEY = SUPABASE_ANON;
+
+    // For Alankaram in Tisram nadai → use the Tisram-pattern variant in the edge function.
+    // For all other varisais, pass the nadai (gati) value so the edge function
+    // can return patterns with the correct number of notes per aksharam.
+    const efVarisai = (isTisram && varisaiSelect.value === "Alankaram")
+      ? "Alankaram-Tisram"
+      : varisaiSelect.value;
+
     const efRes = await fetch(efUrl, {
       method: 'POST',
       headers: {
@@ -797,9 +946,10 @@ if (!skipVarisai) {
         'apikey':        ANON_KEY
       },
       body: JSON.stringify({
-        varisai:  varisaiSelect.value,
+        varisai:  efVarisai,
         ragaType: ragaType,
-        arohanam: aro || ''
+        arohanam: aro || '',
+        nadai:    currentGati          // ← tell the edge function which gati
       })
     });
 
@@ -808,31 +958,41 @@ if (!skipVarisai) {
       console.error('[Patterns] Edge Function HTTP error:', efRes.status, errText);
       stopTanpura();
       isPlaying = false;
+      _playLock = false;
       return;
     }
 
     efResponse = await efRes.json();
+
+    // ── Session guard: Stop+Play can happen while the fetch was in flight ──
+    // If playSessionId changed since we started, a new session is already
+    // running. Bail out silently — don't touch isPlaying (the new session owns it).
+    if (mySessionId !== playSessionId) {
+      stopTanpura();
+      _playLock = false;
+      return;
+    }
+
   } catch (err) {
     console.error('[Patterns] Edge Function fetch failed:', err);
     stopTanpura();
     isPlaying = false;
+    _playLock = false;
     return;
   }
 
-  // ── 1st Speed Only filter ──────────────────────────────────────────────
-  // If "1st Speed only" checkbox is checked, reduce each pid to a single
-  // pass at 1× base BPM.
-  //
-  // Normal patterns have a 1× item in the queue — keep just that one.
-  // Sarali patterns 10-14 only appear at 2× and 4× in the Edge Function
-  // output (they always skip 1st speed normally). When "1st Speed only"
-  // is checked, we take the lowest-multiplier item for that pid and
-  // rewrite its bpm to 1 so it plays at the user's chosen base speed.
-  const firstSpeedOnly = document.getElementById('firstSpeedOnly')?.checked;
+  // ── 1st Speed Only / Tisram singing filter ────────────────────────────
+  const firstSpeedOnly = (variety === 'firstSpeed') ||
+                         document.getElementById('firstSpeedOnly')?.checked;
+
+  // isTisramNonAlankaram: Tisram nadai selected for a non-Alankaram varisai
+  // via the old gati dropdown path (now unused in guided mode, kept for compat).
+  isTisramNonAlankaram = isTisram && varisaiSelect.value !== 'Alankaram' && varisaiSelect.value !== 'Alankaram-Tisram';
+  const forceFirstSpeed = (firstSpeedOnly && !isTisramSinging) || isTisramNonAlankaram;
 
   let rawQueue = efResponse.playQueue;
 
-  if (firstSpeedOnly) {
+  if (forceFirstSpeed) {
     // Group by pid, keep the item with the smallest raw bpm value per pid,
     // then force that item's bpm multiplier to 1.
     const byPid = new Map();
@@ -856,15 +1016,52 @@ if (!skipVarisai) {
       }));
   }
 
-  // Scale the BPM multipliers from the Edge Function (1/2/4) by the user's chosen base BPM
-  playQueueGlobal = rawQueue.map(item => ({
-    ...item,
-    bpm:          item.bpm * bpm,
-    metronomeBpm: item.metronomeBpm * bpm
-  }));
+  // Scale the BPM multipliers from the Edge Function (1/2/4) by the user's chosen base BPM.
+  if (isTisramSinging) {
+    // Map edge function bpm values to Tisram multipliers.
+    // The edge function intentionally omits 1st speed for patterns 10-14 (it sends
+    // bpm:2 as the first/slowest speed for those patterns). Deduplication by pid+bpm
+    // key drops the duplicate 3rd-speed repeat the edge function sends per pattern.
+    //
+    //   Edge bpm 1 → Tisram ×1   → label "1st Speed"
+    //   Edge bpm 2 → Tisram ×1.5 → label "2nd Speed"
+    //   Edge bpm 4 → Tisram ×3   → label "3rd Speed"
+    //
+    // Patterns 10-14 start at bpm:2, so they correctly play 2nd then 3rd speed only,
+    // grouped the same way Normal Sarali is: all 2nd speeds first, then all 3rd speeds.
+    const seenPidBpm = new Set();
+    playQueueGlobal = [];
+    for (const item of rawQueue) {
+      const key = `${item.pid}-${item.bpm}`;
+      if (seenPidBpm.has(key)) continue;  // drop duplicate 3rd-speed repeat
+      seenPidBpm.add(key);
+      let tisramM, speedLabel;
+      if (item.bpm === 1)      { tisramM = 1;        speedLabel = '1st Speed'; }
+      else if (item.bpm === 2) { tisramM = 1.5;      speedLabel = '2nd Speed'; }
+      else if (item.bpm === 4) { tisramM = 3;        speedLabel = '3rd Speed'; }
+      else                     { tisramM = item.bpm; speedLabel = item.label;  }
+      playQueueGlobal.push({
+        ...item,
+        label:        speedLabel,
+        bpm:          tisramM * bpm,
+        metronomeBpm: item.metronomeBpm * bpm,
+      });
+    }
+  } else {
+    playQueueGlobal = rawQueue.map(item => ({
+      ...item,
+      // Trust item.label from the edge function for all varisais, including
+      // Alankaram-Tisram. The edge function already sends the correct labels:
+      //   "1st Speed", "2nd Speed", "Tisram", "Tisram (Repeat)",
+      //   "Tisram (Repeat 2)", "3rd Speed", "3rd Speed (Repeat)"
+      label:        item.label,
+      bpm:          item.bpm * bpm,
+      metronomeBpm: item.metronomeBpm * bpm,
+    }));
+  }
 
-  // If this is an Alankaram session, store the talam names for display
-  if (['Alankaram','Alankaram-Tisram'].includes(varisaiSelect.value) && efResponse.alankaramMeta) {
+  // If this is an Alankaram session (either variant), store the talam names for display
+  if ((varisaiSelect.value === 'Alankaram' || varisaiSelect.value === 'Alankaram-Tisram') && efResponse.alankaramMeta) {
     window._alankaramNamesLive = efResponse.alankaramMeta.names;
   } else {
     window._alankaramNamesLive = null;
@@ -896,9 +1093,17 @@ if (!skipVarisai) {
 
   if (progressBar) progressBar.value = 0;
 
+  buildBeatDots();  // rebuild with correct talam/jati for current mode
+
   /* === PLAYBACK LOOP === */
   let lastPatternId = null;
-  let lastBpm = null;  // track speed-tier changes for metronomeBeatAccum reset
+  let lastBpm   = null;
+  let lastLabel = null;
+
+  // _metronomeStartTime is set the first time playPattern runs so metronome
+  // and notes share the exact same audio clock origin.
+  let _metronomeStarted = false;
+  let _nextLineStart = null;   // Web Audio clock time for next line's t0 — chains patterns seamlessly
 
   for (; currentQueueIndex < playQueueGlobal.length; currentQueueIndex++) {
 
@@ -906,8 +1111,9 @@ if (!skipVarisai) {
 
   // 🔁 HANDLE SKIP REQUESTS (single source of truth)
   //
-  // IMPORTANT: When a skip is triggered mid-playback, hardStopAllAudio() causes
-  // playPattern() to return "SKIP". The inner line loop then breaks, and the outer
+  // IMPORTANT: When a skip is triggered mid-playback, silenceAllAudioInstantly() mutes
+  // the output and sets skipRequested. The playPattern sleep loop checks skipRequested
+  // and returns "SKIP". The inner line loop then breaks, and the outer
   // for-loop executes its own currentQueueIndex++ BEFORE reaching this check again
   // via continue. So currentQueueIndex here is already 1 ahead of where playback
   // actually stopped. We correct with (currentQueueIndex - 1) as the played index.
@@ -915,9 +1121,12 @@ if (skipRequested === "FORWARD") {
   skipRequested = false;
   const playedIndex = Math.max(0, currentQueueIndex - 1);
   const nextPidStart = findNextPatternIndex(playedIndex);
-  currentQueueIndex = nextPidStart - 1; // -1 because for-loop continue will ++ again
+  currentQueueIndex = nextPidStart - 1;
   lastPatternId = null;
+  lastLabel     = null;
   lastBpm = null;
+  _nextLineStart = null;
+  _metronomeStarted = false;  // restart metronome in sync with next pattern's first line
   continue;
 }
 
@@ -928,9 +1137,12 @@ if (skipRequested === "BACKWARD") {
   const target = (playedIndex - currentStart <= 1 && currentStart > 0)
     ? findPrevPatternIndex(currentStart)
     : currentStart;
-  currentQueueIndex = target - 1; // -1 because for-loop continue will ++ again
+  currentQueueIndex = target - 1;
   lastPatternId = null;
+  lastLabel     = null;
   lastBpm = null;
+  _nextLineStart = null;
+  _metronomeStarted = false;  // restart metronome in sync with next pattern's first line
   continue;
 }
 
@@ -939,44 +1151,55 @@ if (skipRequested === "BACKWARD") {
   if (!isPlaying) break;
 
     // Determine the talam for this item
-    let newTalamKey = "adi";
+    let newTalamKey = "triputa"; // default = Adi (Chatusra jati Triputa)
     let title = `${item.label} (Pattern ${item.pid})`;
-    if (varisaiSelect.value === "Alankaram" || varisaiSelect.value === "Alankaram-Tisram") {
+    const isAlankaramVariant = (varisaiSelect.value === "Alankaram" || varisaiSelect.value === "Alankaram-Tisram");
+    if (isAlankaramVariant) {
       const tala = (window._alankaramNamesLive || {})[item.pid];
       if (tala) {
         title =
           `<span style="font-size:14px;color:#555">${tala}</span><br>` +
           `<b>${item.label} (Pattern ${item.pid})</b>`;
       }
-      newTalamKey = ALANKARAM_TALAM_MAP[item.pid] || "adi";
+      newTalamKey = ALANKARAM_TALAM_MAP[item.pid] || "triputa";
+      // Also update jati — each Alankaram talam has its own prescribed jati
+      currentJati = ALANKARAM_JATI_MAP[item.pid] || 4;
     }
 
-    // Always keep currentTalamKey in sync with the current item.
-    // For Alankaram, each pid maps to a different talam — this must be set
-    // on every queue item so it is never stale when scheduleMetronomeClick fires.
-    currentTalamKey = newTalamKey;
+    const pidChanged   = (item.pid   !== lastPatternId);
+    const labelChanged = (item.label !== lastLabel);
 
-    // Reset beat counters and rebuild dots when pid changes (new alankaram pattern).
-    // Also reset metronomeBeatAccum when bpm changes (speed tier changes: 1st→2nd→Tisram→3rd)
-    // so the click grid stays aligned across lines within each speed tier.
-    const pidChanged = (item.pid !== lastPatternId);
-    const bpmChanged = (item.bpm !== lastBpm);
+    // On pattern change: reset both _nextLineStart and _metronomeStarted so the
+    // new pattern always starts from a fresh audio clock anchor (currentTime+0.05).
+    // NOT resetting _nextLineStart was the root cause of overlap — a stale future
+    // Web Audio timestamp from the previous pattern would cause the new pattern's
+    // notes to schedule far ahead, fire instantly, and play simultaneously with
+    // the previous pattern's tail. The first-line sync block handles the cold-start
+    // (lineStartTime === null) path correctly for all cases.
     if (pidChanged) {
-      metronomeBeat = 0;
-      metronomeBeatAccum = 0;
+      _nextLineStart = null;
+      _metronomeStarted = false;
+      currentTalamKey = newTalamKey;
+      // Update jati for Alankaram variants — each pid has its own prescribed jati
+      if (isAlankaramVariant) {
+        currentJati = ALANKARAM_JATI_MAP[item.pid] || 4;
+      }
       if (isMetronomeEnabled()) buildBeatDots();
-    } else if (bpmChanged) {
-      metronomeBeatAccum = 0;
+      displayFullPattern(title, item.patternGroup);
+    } else if (labelChanged) {
+      // Same pattern, different speed/label (e.g. 1st → 2nd → 3rd speed of Sarali).
+      // Update the title in the display without resetting timing or metronome.
+      displayFullPattern(title, item.patternGroup);
     }
+
     lastPatternId = item.pid;
-    lastBpm = item.bpm;
+    lastLabel     = item.label;
+    lastBpm       = item.bpm;
 
     if (isMetronomeEnabled()) {
       const display = document.getElementById('metronomeBeatDisplay');
       if (display) display.style.display = 'inline-flex';
     }
-
-    displayFullPattern(title, item.patternGroup);
 
     for (let _li = 0; _li < item.patternGroup.length; _li++) {
       const line = item.patternGroup[_li];
@@ -1006,252 +1229,553 @@ if (skipRequested === "BACKWARD") {
           lineToPlay = resolveAudavaPattern(line, ragamNotes);
         }
 
+        // Compute t0 for first line — start metronome in sync with first note.
+        // After that, chain each line from where the previous ended (result.nextT).
+        let lineStartTime = _nextLineStart;
+        if (!_metronomeStarted && _li === 0) {
+          const ctx = getAudioCtx();
+          lineStartTime = ctx.currentTime + 0.05;
+          if (isMetronomeEnabled() && !skipVarisai) {
+            startMetronome(ctx, bpm, currentGati, lineStartTime, false, isTisramSinging);
+          }
+          _metronomeStarted = true;
+        }
+
+        // ── SAFETY GUARD: discard stale lineStartTime from a replaced context ──
+        // If lineStartTime is more than 2 seconds ahead of the current audio clock,
+        // the timestamp is from a previous AudioContext (Stop+Play race or browser
+        // suspension). Discard it and force a cold-start anchor instead.
+        // This is a last-resort catch — the session ID check in playPattern is the
+        // primary fix, but this prevents any stale timestamp from being used at all.
+        if (lineStartTime !== null) {
+          const _guardCtx = getAudioCtx();
+          if (lineStartTime > _guardCtx.currentTime + 2.0) {
+            console.warn(
+              `[OVERLAP-GUARD] Stale lineStartTime detected (${lineStartTime.toFixed(3)}s vs ctx ${_guardCtx.currentTime.toFixed(3)}s) — discarding`
+            );
+            lineStartTime = _guardCtx.currentTime + 0.05;
+            _metronomeStarted = false;
+          }
+        }
+
         const result = await playPattern(
             lineToPlay,
             item.bpm,
             ragamNotes,
             srutiFactor,
             false,
-            item.metronomeBpm ?? item.bpm
+            lineStartTime,
+            mySessionId
         );
 
       if (result === "STOP") {
+        stopMetronome();
         stopTanpura();
         isPlaying = false;
+        _playLock = false;
         return;
       }
 
       if (result === "SKIP") {
-        // let outer loop handle skip cleanly
+        _nextLineStart = null;
+        _metronomeStarted = false;  // so next pattern restarts metronome in sync
         break;
       }
+
+      // Chain: next line starts exactly where this one ended on the Web Audio clock
+      _nextLineStart = result.nextT;
 
     }
   }
 
+  // Tell the metronome scheduler not to fire any clicks after the last note ends.
+  // This prevents pre-scheduled sub-clicks from firing naked after music stops.
+  if (_nextLineStart !== null) _metronomeEndTime = _nextLineStart;
+  stopMetronome();
   stopTanpura();
   isPlaying = false;
+  _playLock = false;
 }
 
-/***********************
- * METRONOME — TALAM-AWARE
- * Supports Adi talam (default) and all 7 Alankaram talams.
- *
- * Each talam definition:
- *   beats   – total beat count per cycle
- *   accents – array of length `beats`:
- *               "sam"   = beat 1 (loudest)
- *               "laghu" = laghu subdivision (medium)
- *               "wave"  = drutam/anudruta wave (medium-loud)
- *               "finger"= drutam finger tap (soft)
- *   label   – short display name
- ***********************/
-const TALAM_DEFS = {
-  // Adi talam: laghu(4) + drutam(2) + drutam(2)
-  adi: {
-    beats: 8,
-    accents: ["laghu","laghu","laghu","laghu", "wave","finger", "wave","finger"],
-    label: "Adi",
-    groups: [[0,1,2,3],[4,5],[6,7]]
-  },
-  // 1. Chatushra Jaati Druva: laghu(4)+drutam(2)+laghu(4)+laghu(4) = 14
-  druva: {
-    beats: 14,
-    accents: ["laghu","laghu","laghu","laghu", "wave","finger",
-              "laghu","laghu","laghu","laghu", "laghu","laghu","laghu","laghu"],
-    label: "Druva",
-    groups: [[0,1,2,3],[4,5],[6,7,8,9],[10,11,12,13]]
-  },
-  // 2. Chatushra Jaati Matya: laghu(4)+drutam(2)+laghu(4) = 10
-  matya: {
-    beats: 10,
-    accents: ["laghu","laghu","laghu","laghu", "wave","finger", "laghu","laghu","laghu","laghu"],
-    label: "Matya",
-    groups: [[0,1,2,3],[4,5],[6,7,8,9]]
-  },
-  // 3. Chatushra Jaati Rupaka: drutam(2)+laghu(4) = 6
-  rupaka: {
-    beats: 6,
-    accents: ["wave","finger", "laghu","laghu","laghu","laghu"],
-    label: "Rupaka",
-    groups: [[0,1],[2,3,4,5]]
-  },
-  // 4. Mishra Jaati Jhampa: laghu(7)+anudruta(1)+drutam(2) = 10
-  jhampa: {
-    beats: 10,
-    accents: ["laghu","laghu","laghu","laghu","laghu","laghu","laghu", "anudruta", "wave","finger"],
-    label: "Jhampa",
-    groups: [[0,1,2,3,4,5,6],[7],[8,9]]
-  },
-  // 5. Thrisra Jaati Triputa: laghu(3)+drutam(2)+drutam(2) = 7
-  triputa: {
-    beats: 7,
-    accents: ["laghu","laghu","laghu", "wave","finger", "wave","finger"],
-    label: "Triputa",
-    groups: [[0,1,2],[3,4],[5,6]]
-  },
-  // 6. Khanda Jaati Ata: laghu(5)+laghu(5)+drutam(2)+drutam(2) = 14
-  ata: {
-    beats: 14,
-    accents: ["laghu","laghu","laghu","laghu","laghu",
-              "laghu","laghu","laghu","laghu","laghu",
-              "wave","finger", "wave","finger"],
-    label: "Ata",
-    groups: [[0,1,2,3,4],[5,6,7,8,9],[10,11],[12,13]]
-  },
-  // 7. Chatushra Jaati Eka: laghu(4) = 4
-  eka: {
-    beats: 4,
-    accents: ["laghu","laghu","laghu","laghu"],
-    label: "Eka",
-    groups: [[0,1,2,3]]
-  }
+/* ══════════════════════════════════════════════════════════════════════════
+   METRONOME ENGINE — Sooladi Sapta Talam × Jati × Gati
+   ──────────────────────────────────────────────────────────────────────────
+   Architecture:
+   • Talams are built dynamically from anga definitions + chosen jati,
+     exactly matching the standalone metronome widget.
+   • Runs a Web Audio lookahead scheduler (independent of note playback).
+   • One click per aksharam "tha" beat; gati sub-syllables fire as soft clicks.
+   • Beat-dot display lights on every aksharam "tha", ignores sub-syllables.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+// ── Talam family definitions (anga sequences) ─────────────────────────────
+// Each anga: "L" = laghu (length = jati), "D" = drutam (always 2), "A" = anudruta (always 1)
+const TALAM_ANGAS = {
+  druva:   { angas: ["L","D","L","L"], label: "Druva"  },
+  matya:   { angas: ["L","D","L"],     label: "Matya"  },
+  rupaka:  { angas: ["D","L"],         label: "Rupaka" },
+  jhampa:  { angas: ["L","A","D"],     label: "Jhampa" },
+  triputa: { angas: ["L","D","D"],     label: "Triputa"},
+  ata:     { angas: ["L","L","D","D"], label: "Ata"    },
+  eka:     { angas: ["L"],             label: "Eka"    },
 };
 
-// Map alankaram pattern index → talam key
+// Alankaram pattern pid → jati (finger count for Laghu)
+const ALANKARAM_JATI_MAP = {
+  1: 4,  // Druva    — Chatusra jati
+  2: 4,  // Matya    — Chatusra jati
+  3: 4,  // Rupaka   — Chatusra jati
+  4: 7,  // Jhampa   — Mishra jati
+  5: 3,  // Triputa  — Tisra jati
+  6: 5,  // Ata      — Khanda jati
+  7: 4,  // Eka      — Chatusra jati
+};
+
+// Alankaram pattern pid → talam family key
 const ALANKARAM_TALAM_MAP = {
   1: "druva", 2: "matya", 3: "rupaka",
   4: "jhampa", 5: "triputa", 6: "ata", 7: "eka"
 };
 
-let metronomeBeat = 0;      // current beat index within the talam cycle
-let metronomeBeatAccum = 0; // note-beats elapsed since last metronome tick
-let currentTalamKey = null; // null forces rebuild on first item
+// ── Build aksharams array for a given talam + jati ────────────────────────
+// Returns [{accent, angaLabel}, …] — one entry per aksharam beat.
+// accent values: "sam" | "laghu" | "drutam-wave" | "drutam-finger" | "anudruta"
+function buildTalamAksharams(talamKey, jati) {
+  const def = TALAM_ANGAS[talamKey];
+  if (!def) return buildTalamAksharams("triputa", 4); // fallback = Adi
+  const result = [];
+  for (const a of def.angas) {
+    if (a === "L") {
+      for (let i = 0; i < jati; i++) {
+        result.push({ accent: "laghu", angaLabel: "L" });
+      }
+    } else if (a === "D") {
+      result.push({ accent: "drutam-wave",   angaLabel: "D" });
+      result.push({ accent: "drutam-finger", angaLabel: "D" });
+    } else if (a === "A") {
+      result.push({ accent: "anudruta", angaLabel: "A" });
+    }
+  }
+  if (result.length > 0) result[0].accent = "sam";
+  return result;
+}
 
-function scheduleMetronomeClick(ctx, t, beatIndex) {
-  const talam = TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi;
-  const accent = talam.accents[beatIndex % talam.beats] || "laghu";
+// ── Groups array for dot display (anga boundaries) ────────────────────────
+function buildTalamGroups(talamKey, jati) {
+  const def = TALAM_ANGAS[talamKey];
+  if (!def) return buildTalamGroups("triputa", 4);
+  const groups = [];
+  let cursor = 0;
+  for (const a of def.angas) {
+    const size = a === "L" ? jati : a === "D" ? 2 : 1;
+    const group = [];
+    for (let i = 0; i < size; i++) group.push(cursor++);
+    groups.push(group);
+  }
+  return groups;
+}
 
-  const osc = ctx.createOscillator();
+// ── Active metronome state ────────────────────────────────────────────────
+let currentTalamKey = "triputa"; // default = Adi (Chatusra jati Triputa)
+let currentJati     = 4;         // Chatusra jati
+let currentGati     = 4;         // Chatusra nadai (default)
+
+let _metronomeTimer  = null;
+let _metronomeActive = false;
+let _metronomeEndTime = Infinity;
+let _pendingOscillators = [];   // sub-click oscs scheduled ahead — stopped on metronome stop
+
+function _gatiSubClick(ctx, t) {
+  const osc  = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain);
+  gain.connect(masterGain || ctx.destination);
+  osc.frequency.value = 600;
+  gain.gain.setValueAtTime(0.30, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+  osc.start(t);
+  osc.stop(t + 0.05);
+  _pendingOscillators.push(osc);
+}
+
+function _metronomeClick(ctx, t, accent) {
+  const osc  = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.connect(gain);
   gain.connect(masterGain || ctx.destination);
 
-  if (beatIndex % talam.beats === 0) {
-    osc.frequency.value = 1200;
-    gain.gain.setValueAtTime(0.55, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
-  } else if (accent === "wave") {
-    osc.frequency.value = 900;
-    gain.gain.setValueAtTime(0.32, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+  if (accent === "sam") {
+    osc.frequency.value = 1400;
+    gain.gain.setValueAtTime(0.70, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
   } else if (accent === "laghu") {
-    osc.frequency.value = 700;
+    osc.frequency.value = 900;
+    gain.gain.setValueAtTime(0.38, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  } else if (accent === "drutam-wave") {
+    osc.frequency.value = 750;
+    gain.gain.setValueAtTime(0.30, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  } else if (accent === "drutam-finger") {
+    osc.frequency.value = 550;
     gain.gain.setValueAtTime(0.20, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
-  } else { // finger
-    osc.frequency.value = 600;
-    gain.gain.setValueAtTime(0.13, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+  } else { // anudruta
+    osc.frequency.value = 660;
+    gain.gain.setValueAtTime(0.24, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
   }
 
-  osc.start(t);
-  osc.stop(t + 0.07);
+  osc.start(t); osc.stop(t + 0.09);
+  _pendingOscillators.push(osc);
+}
 
-  const delay = Math.max(0, (t - ctx.currentTime) * 1000);
-  setTimeout(() => updateBeatDisplay(beatIndex), delay);
+// ── Metronome timing ──────────────────────────────────────────────────────
+// BPM = aksharams per minute at Chatusram reference.
+// matraDur = aksharamDur / 4 — the constant matra pulse.
+// aksharamDur scales with gati so Kandam/Misram aksharams are longer.
+//
+//   matraDur    = (21.6 / baseBpm) / 4   ← constant matra pulse
+//   aksharamDur = matraDur * gati
+//
+// At 80 BPM, matraDur = 0.0675 s:
+//   Tisram    (3): aksharamDur = 0.2025 s  — wait, that's too fast.
+//
+// Correct: BPM = aksharams/min. aksharamDur = 21.6/baseBpm for Chatusram.
+// matraDur = aksharamDur / gati. For other gatis, aksharamDur stays the
+// same (same foot-tap rate) but matraDur shrinks for higher gatis.
+// Sub-clicks fire silently at each matra to drive the timing loop.
+//
+// TALA PRACTICE: user wants same BPM label = same matra speed across gatis.
+// So matraDur is constant = 21.6/baseBpm, aksharamDur = matraDur * gati.
+// Main click fires every gati matras. This is the correct Carnatic model:
+// same matra pulse, grouping changes.
+
+const GATI_MATRAS = { 3: 3, 4: 4, 5: 5, 7: 7 };
+
+function startMetronome(ctx, baseBpm, gati, startTime, forceTalam = false, tisramSinging = false) {
+  stopMetronome();
+  if (!isMetronomeEnabled(forceTalam)) return;
+
+  _metronomeActive = true;
+  _metronomeEndTime = Infinity;
+
+  const aksharams   = buildTalamAksharams(currentTalamKey, currentJati);
+  const totalAk     = aksharams.length;
+  const matraDur    = 21.6 / baseBpm;
+  const aksharamDur = matraDur * gati;   // gati=3 for Tisram → correct aksharam length
+
+  const LOOKAHEAD = 0.15;
+  const TICK_MS   = 50;
+
+  let nextTime = startTime;
+  let akCursor = 0;
+
+  function schedule() {
+    if (!_metronomeActive) { stopMetronome(); return; }
+
+    const now = ctx.currentTime;
+    while (nextTime < now + LOOKAHEAD) {
+      const ak     = akCursor % totalAk;
+      const accent = aksharams[ak].accent;
+      const t      = nextTime;
+
+      // Only schedule clicks up to the end time — prevents pre-scheduled
+      // sub-clicks from firing naked after the last note ends.
+      if (t >= _metronomeEndTime) break;
+
+      // Main aksharam click — audible, pitched by anga type
+      _metronomeClick(ctx, t, accent);
+
+      // Tisram singing: fire 2 audible sub-clicks at 1/3 and 2/3 of each
+      // aksharam so the student hears the ta · ki · ta grouping clearly.
+      if (tisramSinging) {
+        if (t + matraDur     < _metronomeEndTime) _gatiSubClick(ctx, t + matraDur);
+        if (t + matraDur * 2 < _metronomeEndTime) _gatiSubClick(ctx, t + matraDur * 2);
+      }
+
+      const delay = Math.max(0, (t - now) * 1000);
+      const capturedAk = ak;
+      _displayTimers.push(setTimeout(() => updateBeatDisplay(capturedAk), delay));
+
+      nextTime += aksharamDur;
+      akCursor++;
+    }
+  }
+
+  _metronomeTimer = setInterval(schedule, TICK_MS);
+  schedule();
+}
+
+function stopMetronome() {
+  _metronomeActive = false;
+  _clearDisplayTimers();
+  if (_metronomeTimer !== null) {
+    clearInterval(_metronomeTimer);
+    _metronomeTimer = null;
+  }
+  // Hard-stop any pre-scheduled sub-click oscillators.
+  // IMPORTANT: do NOT call getAudioCtx() here — if hardStopAllAudio() already
+  // nulled audioCtx, calling getAudioCtx() would silently recreate it, leaving
+  // a zombie AudioContext open that the next Play session has to fight with.
+  if (audioCtx) {
+    const now = audioCtx.currentTime;
+    for (const osc of _pendingOscillators) {
+      try { osc.stop(now); } catch(e) {}
+    }
+  }
+  _pendingOscillators = [];
+  _metronomeEndTime = Infinity;
+}
+
+// Called from HTML when user clicks a talam button
+function setCurrentTalam(key) {
+  currentTalamKey = key;
+  buildBeatDots();
+}
+
+// ── Dot display ───────────────────────────────────────────────────────────
+let _litDotIdx = -1;          // tracks which dot is currently lit
+let _displayTimers = [];      // pending setTimeout handles for dot updates
+
+function _clearDisplayTimers() {
+  _displayTimers.forEach(t => clearTimeout(t));
+  _displayTimers = [];
 }
 
 function buildBeatDots() {
   const display = document.getElementById('metronomeBeatDisplay');
   if (!display) return;
-  const talam = TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi;
+
+  _litDotIdx = -1;
+  _clearDisplayTimers();   // cancel any stale callbacks before rebuilding DOM
+
+  const aksharams = buildTalamAksharams(currentTalamKey, currentJati);
+  const groups    = buildTalamGroups(currentTalamKey, currentJati);
+
   display.innerHTML = "";
-  talam.groups.forEach((group, gi) => {
-    group.forEach((bi) => {
+
+  let akIdx = 0;
+  groups.forEach((group, gi) => {
+    group.forEach(() => {
       const dot = document.createElement('span');
-      dot.className = 'beat-dot' + (bi === 0 ? ' sam' : '');
-      dot.id = 'mbd' + bi;
-      dot.title = talam.accents[bi];
+      const accent = aksharams[akIdx].accent;
+      dot.className = 'beat-dot' + (accent === 'sam' ? ' sam' : '');
+      dot.id = 'mbd' + akIdx;
+      dot.dataset.accent = accent;
+      dot.title = accent;
       display.appendChild(dot);
+      akIdx++;
     });
-    // spacer between groups
-    if (gi < talam.groups.length - 1) {
-      const sp = document.createElement('span');
-      sp.style.cssText = 'width:5px;display:inline-block';
-      display.appendChild(sp);
+    if (gi < groups.length - 1) {
+      const gap = document.createElement('span');
+      gap.className = 'anga-gap';
+      display.appendChild(gap);
     }
   });
 }
 
-function updateBeatDisplay(beatIndex) {
-  const talam = TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi;
-  for (let i = 0; i < talam.beats; i++) {
-    const dot = document.getElementById('mbd' + i);
-    if (dot) dot.classList.remove(
-      'lit-laghu', 'lit-wave', 'lit-finger', 'lit-anudruta'
-    );
+function updateBeatDisplay(akIdx) {
+  const display = document.getElementById('metronomeBeatDisplay');
+  if (!display) return;
+
+  // Count dots from DOM — avoids stale total if talam changed
+  const allDots = display.querySelectorAll('.beat-dot');
+  const total   = allDots.length;
+  if (total === 0) return;
+
+  const idx = akIdx % total;
+
+  // Clear only the previously lit dot
+  if (_litDotIdx >= 0 && _litDotIdx < total) {
+    const prev = document.getElementById('mbd' + _litDotIdx);
+    if (prev) {
+      const a = prev.dataset.accent || 'laghu';
+      prev.className = 'beat-dot' + (a === 'sam' ? ' sam' : '');
+    }
   }
-  const idx = beatIndex % talam.beats;
+
+  // Light the current dot using data-accent baked in at buildBeatDots time
   const dot = document.getElementById('mbd' + idx);
   if (dot) {
-    const accent = talam.accents[idx] || 'laghu';
-    if (accent === 'wave') {
-      dot.classList.add('lit-wave');
-    } else if (accent === 'finger') {
-      dot.classList.add('lit-finger');
-    } else if (accent === 'anudruta') {
-      dot.classList.add('lit-anudruta');
-    } else {
-      // sam and laghu both get red
-      dot.classList.add('lit-laghu');
-    }
+    const accent = dot.dataset.accent || 'laghu';
+    const litClass =
+      accent === 'sam'           ? 'lit-sam'      :
+      accent === 'laghu'         ? 'lit-laghu'    :
+      accent === 'drutam-wave'   ? 'lit-wave'     :
+      accent === 'drutam-finger' ? 'lit-finger'   :
+      accent === 'anudruta'      ? 'lit-anudruta' : 'lit-laghu';
+    dot.className = 'beat-dot' + (accent === 'sam' ? ' sam' : '') + ' ' + litClass;
+    _litDotIdx = idx;
   }
 }
 
 function resetBeatDisplay() {
-  const talam = TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi;
-  for (let i = 0; i < talam.beats; i++) {
-    const dot = document.getElementById('mbd' + i);
-    if (dot) dot.classList.remove('lit-laghu','lit-wave','lit-finger','lit-anudruta');
+  _litDotIdx = -1;
+  const aksharams = buildTalamAksharams(currentTalamKey, currentJati);
+  for (let i = 0; i < aksharams.length; i++) {
+    const d = document.getElementById('mbd' + i);
+    if (d) {
+      const accent = d.dataset.accent || aksharams[i].accent;
+      d.className = 'beat-dot' + (accent === 'sam' ? ' sam' : '');
+    }
   }
 }
 
-function isMetronomeEnabled() {
+function isMetronomeEnabled(forceTalam = false) {
+  // In talam-only or self-practice mode the metronome IS the point —
+  // bypass the checkbox and ragaType restrictions entirely.
+  if (forceTalam) return true;
   if (!document.getElementById('metronomeOn')?.checked) return false;
-  // No metronome for janya ragam (plays aro/ava only, not a fixed pattern)
   const ragaType = document.querySelector('input[name=ragaType]:checked')?.value;
   if (ragaType === 'janya') return false;
   return true;
 }
 
 function isAlankaramSelected() {
-  const v = document.getElementById('varisai')?.value; return v === 'Alankaram' || v === 'Alankaram-Tisram';
+  return document.getElementById('varisai')?.value === 'Alankaram';
 }
 
-// Show/hide beat dots when checkbox changes
+// selectTalam / selectJati / selectGati — called by dropdowns in app.html
+function selectTalam(key) {
+  currentTalamKey = key;
+  buildBeatDots();
+}
+
+function selectJati(val) {
+  currentJati = val;
+  buildBeatDots();
+}
+
+function selectGati(val) {
+  currentGati = val;
+  // No dot rebuild needed — gati doesn't change dot layout, only timing
+}
+
+// Initialise on DOM ready
 document.addEventListener('DOMContentLoaded', () => {
-  const cb = document.getElementById('metronomeOn');
-  const display = document.getElementById('metronomeBeatDisplay');
-  if (cb && display) {
-    cb.addEventListener('change', () => {
-      if (cb.checked) {
-        buildBeatDots();
-        display.style.display = 'inline-flex';
-      } else {
-        display.style.display = 'none';
-        resetBeatDisplay();
-      }
-    });
-  }
-  // Build default Adi talam dots on load
-  currentTalamKey = "adi";
+  currentTalamKey = "triputa";
+  currentJati     = 4;
+  currentGati     = 4;
   buildBeatDots();
 });
 
+/* ══════════════════════════════════════════════════════════════════════════
+   PRACTICE MODE — Tala Only
+   ──────────────────────────────────────────────────────────────────────────
+   Activated by the "Tala practice only" checkbox.
+   Reads talam/jati/gati from the dedicated tala practice selectors.
+   ══════════════════════════════════════════════════════════════════════════ */
 
-async function playPattern(pattern, bpm, ragamNotes, srutiFactor, isOwnNotes, metronomeBpm) {
+// ── Tala practice UI handlers ─────────────────────────────────────────────
+// ── Variety dropdown handler ───────────────────────────────────────────────
+// Mutually exclusive options: normal / firstSpeed / tala / tisram
+function onVarietyChange(val) {
+  const talaCtrl = document.getElementById('talaPracticeControls');
+  if (talaCtrl) talaCtrl.style.display = (val === 'tala') ? 'block' : 'none';
+  // Rebuild varisai list for all ragam types except audava/shadava (which have fixed lists).
+  // Alankaram-Tisram only appears when variety is NOT tisram singing.
+  const ragaType = document.querySelector('input[name=ragaType]:checked')?.value;
+  if (ragaType !== 'audava' && ragaType !== 'shadava') {
+    loadVarisais(val === 'tisram' ? VARISAI_ALL : VARISAI_ALL_WITH_TISRAM);
+  }
+  buildBeatDots();
+}
+
+// Convenience helpers so old code referencing these still works
+function getVariety() {
+  return document.getElementById('varietySel')?.value || 'normal';
+}
+
+function onTalaPracticeToggle(checked) {
+  // Legacy — called if anything still references it
+  const v = document.getElementById('varietySel');
+  if (v) v.value = checked ? 'tala' : 'normal';
+  onVarietyChange(v?.value || 'normal');
+}
+
+function onTisramSingingToggle(checked) {
+  const v = document.getElementById('varietySel');
+  if (v) v.value = checked ? 'tisram' : 'normal';
+  onVarietyChange(v?.value || 'normal');
+}
+
+function onTpTalamChange(val) {
+  currentTalamKey = val;
+  buildBeatDots();
+}
+
+function onTpJatiChange(val) {
+  currentJati = val;
+  buildBeatDots();
+}
+
+function onTpGatiChange(val) {
+  currentGati = val;
+}
+
+async function practiceMode_TalamOnly(srutiFactor) {
+  // Read from tala practice selectors (not the hidden main talam dropdowns)
+  const tpTalamSel = document.getElementById('tpTalamSel');
+  const tpJatiSel  = document.getElementById('tpJatiSel');
+  const tpGatiSel  = document.getElementById('tpGatiSel');
+  if (tpTalamSel) currentTalamKey = tpTalamSel.value;
+  if (tpJatiSel)  currentJati     = +tpJatiSel.value || 4;
+  if (tpGatiSel)  currentGati     = +tpGatiSel.value || 4;
+
+  const bpmVal   = +document.querySelector("input[name=speed]:checked").value;
+  const talamDef = TALAM_ANGAS[currentTalamKey];
+  const jatiNames = { 3:"Tisra", 4:"Chatusra", 5:"Khanda", 7:"Misra", 9:"Sankeerna" };
+  const gatiNames = { 3:"Tisram", 4:"Chatusram", 5:"Kandam", 7:"Misram" };
+  const talamLabel = `${jatiNames[currentJati] || currentJati} Jati ${talamDef?.label || currentTalamKey}`;
+  const numAksharams = buildTalamAksharams(currentTalamKey, currentJati).length;
+
+  buildBeatDots();
 
   const ctx = getAudioCtx();
-  const baseBeatDur = 60 / bpm;
-  // How many note-beats fit in one talam beat (1 at 1st speed, 2 at 2nd, 4 at 3rd)
-  const beatsPerTick = Math.max(1, Math.round(bpm / (metronomeBpm ?? bpm)));
+  startMetronome(ctx, bpmVal, currentGati, ctx.currentTime + 0.1, true);
+
+  staticInfo.innerHTML =
+    `<b>Tala Practice</b> &nbsp;·&nbsp; ${talamLabel} &nbsp;·&nbsp; ${gatiNames[currentGati] || currentGati} gati` +
+    `<br><span style="font-size:12px;color:#777">${numAksharams} aksharams &nbsp;·&nbsp; ${bpmVal} BPM &nbsp;·&nbsp; Press Stop when done</span>`;
+  dynamicInfo.innerHTML = '';
+
+  while (isPlaying) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+}
+
+async function playPattern(pattern, bpm, ragamNotes, srutiFactor, isOwnNotes, startTime = null, sessionId = 0) {
+
+  const ctx = getAudioCtx();
+  // Capture ctx ONCE here. Every playPiano call below uses this same reference
+  // so that if a skip recreates the AudioContext, this pattern's note scheduling
+  // stays consistent with the timing clock used for the sleep at the end.
+
+  // Ensure masterGain is at full volume — silenceAllAudioInstantly() may have
+  // zeroed it for a skip, and the scheduled restore at +45 ms might not have
+  // fired yet when this call begins (especially at slow BPM where cold-start
+  // happens quickly). Explicitly restoring here is the definitive fix.
+  if (masterGain) {
+    masterGain.gain.cancelScheduledValues(ctx.currentTime);
+    masterGain.gain.setValueAtTime(0.9, ctx.currentTime);
+  }
+
+  const baseBeatDur = (21.6 / bpm) * currentGati;
 
   if (!isPlaying) return "STOP";
 
   const seq = parsePattern(pattern);
 
-  let t = ctx.currentTime + 0.02;
+  // Use caller-provided startTime so metronome and notes share the same audio clock origin.
+  const t0 = startTime !== null ? startTime : ctx.currentTime + 0.05;
+  let t = t0;
+
+  // ── Schedule ALL notes into Web Audio upfront ─────────────────────────
+  // No per-note await — advance t, queue sounds, check stop/skip flags,
+  // then sleep ONCE at the end for the total duration.
+  // This eliminates per-note jitter accumulation that causes sync drift at
+  // higher speeds (3rd speed has 4 notes per metronome tick — 4× the jitter).
 
   for (const ev of seq) {
 
@@ -1263,69 +1787,42 @@ async function playPattern(pattern, bpm, ragamNotes, srutiFactor, isOwnNotes, me
     // =========================
     if (ev.type === "normal") {
 
-  const dur = baseBeatDur * ev.beats;
+      const dur = baseBeatDur * ev.beats;
 
-  // Schedule metronome clicks: one click fires every beatsPerTick note-beats
-  if (isMetronomeEnabled()) {
-    const talamBeats = (TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi).beats;
-    for (let b = 0; b < ev.beats; b++) {
-      if (metronomeBeatAccum % beatsPerTick === 0) {
-        scheduleMetronomeClick(ctx, t + b * baseBeatDur, metronomeBeat % talamBeats);
-        metronomeBeat++;
+      if (!isOwnNotes) {
+
+        const freq = resolveFrequency(ev.note, ragamNotes, srutiFactor, false);
+        if (freq) {
+          if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
+          playPiano(freq, dur, t, ctx);
+        }
+
+      } else {
+
+        const noteToken = ev.note;
+        const isKampita = noteToken.endsWith("^");
+        const glideMatch = noteToken.includes("~");
+        let cleanNote = noteToken.replace("^", "");
+        let freq = null;
+        let glideToFreq = null;
+
+        if (glideMatch) {
+          const parts = cleanNote.split("~");
+          freq = resolveFrequency(parts[0], ragamNotes, srutiFactor, true);
+          glideToFreq = resolveFrequency(parts[1], ragamNotes, srutiFactor, true);
+        } else {
+          freq = resolveFrequency(cleanNote, ragamNotes, srutiFactor, true);
+        }
+
+        if (freq) {
+          if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
+          playPiano(freq, dur, t, ctx);
+        }
       }
-      metronomeBeatAccum++;
+
+      t += dur;
+      playedNotes += ev.beats;
     }
-  }
-
-  if (!isOwnNotes) {
-
-    const freq = resolveFrequency(
-      ev.note,
-      ragamNotes,
-      srutiFactor,
-      false
-    );
-
-    if (freq) {
-      if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
-      playPiano(freq, dur, t);
-    }
-
-  } else {
-
-    const noteToken = ev.note;
-
-    const isKampita = noteToken.endsWith("^");
-    const glideMatch = noteToken.includes("~");
-
-    let cleanNote = noteToken.replace("^", "");
-
-    let freq = null;
-    let glideToFreq = null;
-
-    if (glideMatch) {
-
-      const parts = cleanNote.split("~");
-
-      freq = resolveFrequency(parts[0], ragamNotes, srutiFactor, true);
-      glideToFreq = resolveFrequency(parts[1], ragamNotes, srutiFactor, true);
-
-    } else {
-
-      freq = resolveFrequency(cleanNote, ragamNotes, srutiFactor, true);
-    }
-
-    if (freq) {
-      if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
-      playPiano(freq, dur, t);
-    }
-  }
-
-  // 🔥 THIS WAS MISSING
-  t += dur;
-  await new Promise(r => setTimeout(r, dur * 1000));
-  playedNotes += ev.beats;
-}
 
     // =========================
     // GROUP NOTES
@@ -1336,39 +1833,18 @@ async function playPattern(pattern, bpm, ragamNotes, srutiFactor, isOwnNotes, me
       if (!isOwnNotes) {
 
         let effectiveBpm = bpm;
-
         if (ev.type === "group1") effectiveBpm = bpm + 20;
         if (ev.type === "group2") effectiveBpm = bpm * 2;
-
-        const beatDur = 60 / effectiveBpm;
-
-        // Schedule one metronome click at the start of the group (counts as 1 beat)
-        if (isMetronomeEnabled()) {
-          const talamBeats = (TALAM_DEFS[currentTalamKey] || TALAM_DEFS.adi).beats;
-          if (metronomeBeatAccum % beatsPerTick === 0) {
-            scheduleMetronomeClick(ctx, t, metronomeBeat % talamBeats);
-            metronomeBeat++;
-          }
-          metronomeBeatAccum++;
-        }
+        const beatDur = (21.6 / effectiveBpm) * currentGati;
 
         for (const sub of ev.subEvents) {
           const dur = beatDur * sub.beats;
-
-          const freq = resolveFrequency(
-            sub.note,
-            ragamNotes,
-            srutiFactor,
-            isOwnNotes
-          );
-
+          const freq = resolveFrequency(sub.note, ragamNotes, srutiFactor, isOwnNotes);
           if (freq) {
             if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
-            playPiano(freq, dur, t);
+            playPiano(freq, dur, t, ctx);
           }
-
           t += dur;
-          await new Promise(r => setTimeout(r, dur * 1000));
           playedNotes += sub.beats;
         }
 
@@ -1376,71 +1852,93 @@ async function playPattern(pattern, bpm, ragamNotes, srutiFactor, isOwnNotes, me
       // 🟢 OWN NOTES GAMAKA MODE
       else {
 
-        const totalBeats = ev.subEvents
-          .reduce((s, sub) => s + sub.beats, 0);
-
+        const totalBeats = ev.subEvents.reduce((s, sub) => s + sub.beats, 0);
         const subUnit = baseBeatDur / totalBeats;
 
         for (const sub of ev.subEvents) {
-
           const dur = subUnit * sub.beats;
-
           const noteToken = sub.note;
+          const isKampita = noteToken.endsWith("^");
+          const glideMatch = noteToken.includes("~");
+          let cleanNote = noteToken.replace("^", "");
+          let freq = null;
+          let glideToFreq = null;
 
-const isKampita = noteToken.endsWith("^");
-const glideMatch = noteToken.includes("~");
-
-let cleanNote = noteToken.replace("^", "");
-
-let freq = null;
-let glideToFreq = null;
-
-if (glideMatch) {
-
-  const parts = cleanNote.split("~");
-
-  freq = resolveFrequency(
-    parts[0],
-    ragamNotes,
-    srutiFactor,
-    true
-  );
-
-  glideToFreq = resolveFrequency(
-    parts[1],
-    ragamNotes,
-    srutiFactor,
-    true
-  );
-
-} else {
-
-  freq = resolveFrequency(
-    cleanNote,
-    ragamNotes,
-    srutiFactor,
-    true
-  );
-}
-
-if (freq) {
-            if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
-            playPiano(freq, dur, t);
+          if (glideMatch) {
+            const parts = cleanNote.split("~");
+            freq = resolveFrequency(parts[0], ragamNotes, srutiFactor, true);
+            glideToFreq = resolveFrequency(parts[1], ragamNotes, srutiFactor, true);
+          } else {
+            freq = resolveFrequency(cleanNote, ragamNotes, srutiFactor, true);
           }
 
+          if (freq) {
+            if (typeof scoringOnNote === 'function') scoringOnNote(freq, dur * 1000);
+            playPiano(freq, dur, t, ctx);
+          }
           t += dur;
-          await new Promise(r => setTimeout(r, dur * 1000));
           playedNotes += sub.beats;
-        }  // <-- closes sub loop
-
-      }  // <-- closes OWN NOTES else block
-
-    }  // <-- closes GROUP else
+        }
+      }
+    }
 
     if (progressBar) progressBar.value = (playedNotes / totalNotes) * 100;
   }
 
-  return "DONE";
+  // ── Single sleep for the entire pattern line ──────────────────────────
+  // Use Web Audio clock (t) as reference — immune to JS event loop jitter.
+  if (!isPlaying) return "STOP";
+  if (skipRequested) return "SKIP";
+
+  // ── Guaranteed-yield sleep ────────────────────────────────────────────
+  // Problem diagnosed from OVERLAP-DIAG logs:
+  //   remaining = (t - ctx.now)*1000 - 30
+  //   At 60 BPM the gap between lineStartTime and ctx.now when the DIAG fires
+  //   is only 18–28ms. Subtracting 30ms gives a negative remaining (-12ms to -1ms).
+  //   `if (remaining > 0)` then skips the sleep entirely → setTimeout never fires
+  //   → the JS loop spins at 100% CPU with no yield between lines.
+  //
+  //   Effect: the browser event loop is starved. Stop-button clicks, visibility-
+  //   change events (idle timer), and other async events pile up in the queue.
+  //   When a zero-sleep setTimeout(0) yield finally happens (it still yields once),
+  //   ALL queued events flush simultaneously — including any pending Stop — causing
+  //   an abrupt halt mid-session without the user pressing Stop.
+  //
+  // Fix: always sleep at least MIN_YIELD_MS (= 8ms, above the browser's 4ms floor).
+  // If the real remaining time is larger, use that. This guarantees:
+  //   1. A real yield on every line → events are processed promptly
+  //   2. Wakeup still happens before the line ends at all practical BPMs
+  //   3. No regression at fast BPM (remaining is large enough anyway)
+  //
+  // The 30ms early-wakeup was originally meant to give the loop time to schedule
+  // the next line's notes before the current line finishes. Since ALL notes are
+  // scheduled upfront at the start of playPattern (not per-note), waking up even
+  // 8ms early is more than enough — the scheduling is O(n) note-object creation,
+  // which takes < 1ms for any practical pattern.
+  const MIN_YIELD_MS = 8;
+  const rawRemaining = (t - ctx.currentTime) * 1000 - MIN_YIELD_MS;
+  const sleepMs = Math.max(MIN_YIELD_MS, rawRemaining);
+  await new Promise(r => setTimeout(r, sleepMs));
+
+  // ── CRITICAL: re-check isPlaying AFTER the sleep ──────────────────────
+  // The sleep above can last many seconds (slow BPM, long line). During that
+  // time the user may press Stop, which sets isPlaying=false and nulls audioCtx,
+  // then immediately press Play again, which sets isPlaying=true and creates a
+  // new audioCtx (currentTime=0). Without this check, the old playSelected()
+  // call wakes up, sees isPlaying=true (the NEW session), and returns nextT
+  // from the OLD audio clock (e.g. 322s) — causing the new context to schedule
+  // notes 322 seconds in the future, then fire them all at once when the clock
+  // catches up, overlapping with the new session's notes.
+  if (!isPlaying) return "STOP";
+  if (skipRequested) return "SKIP";
+  // AudioContext null-check: hardStopAllAudio() may have destroyed ctx during
+  // the sleep. If so, our timestamps are stale and must not be returned as nextT.
+  if (!audioCtx || !masterGain) return "STOP";
+  // Session check: if playSessionId changed while we slept, a new play session
+  // has started — our timestamps are from the old AudioContext and must be discarded.
+  if (sessionId !== 0 && sessionId !== playSessionId) return "STOP";
+
+  return { done: true, nextT: t }; // caller uses nextT as startTime for next line
 }
 
 function hardStopAllAudio() {
@@ -1455,6 +1953,30 @@ function hardStopAllAudio() {
   tanpuraSource = null;
 
   // do NOT reset tanpuraBuffer — keep it cached for next play
+}
+
+/**
+ * Silence all scheduled audio IMMEDIATELY without closing the AudioContext.
+ * Used by skip functions so the Web Audio clock and oscillator graph survive —
+ * only the sound is cut.  Already-scheduled oscillator .stop() calls still fire
+ * (cleaning up nodes), but the masterGain ramp to 0 means you hear nothing.
+ * The gain is NOT restored here — startMetronome() and the playback loop both
+ * set gain explicitly before their first note, so restoring it here at a fixed
+ * 45 ms offset risks colliding with the new session's first scheduled sound.
+ */
+function silenceAllAudioInstantly() {
+  if (!audioCtx || !masterGain) return;
+  const now = audioCtx.currentTime;
+  masterGain.gain.cancelScheduledValues(now);
+  // Ramp to zero over 20ms — fast enough to be perceived as instant, but
+  // smooth enough to avoid a click artifact on the currently-playing note.
+  masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+  masterGain.gain.linearRampToValueAtTime(0.0001, now + 0.02);
+  masterGain.gain.setValueAtTime(0, now + 0.02);
+  // Do NOT pre-schedule a restore here. playPattern() sets masterGain.gain = 0.9
+  // at its entry point before scheduling any notes. Pre-scheduling a restore at a
+  // fixed offset from now collides with that explicit set, and also re-amplifies
+  // still-running oscillators from the previous pattern (the root cause of overlap).
 }
 
 /***********************
@@ -1520,6 +2042,7 @@ async function fetchJanyaRecord(id) {
   if (!row) { console.warn('[Janya] No record found for id:', id); return null; }
 
   return {
+    id:         id,           // Supabase row UUID — needed by playSignaturePhrases
     name:       row.name,
     arohanam:   row.arohanam,
     avarohanam: row.avarohanam,
@@ -1676,3 +2199,368 @@ function closeJanyaDropdown() { document.getElementById('janyaDropdown').classLi
     }
   });
 })();
+
+/* ══════════════════════════════════════════════════════════════════════════
+   GAMAKAM ENGINE
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const _GAMAKAM_BASE_FREQS = {
+  s:130.8128,r1:138.5913,r2:146.8324,g1:146.8324,
+  r3:155.5635,g2:155.5635,g3:164.8138,m1:174.6141,
+  m2:184.9972,p:195.9977,d1:207.6524,d2:220.0000,
+  n1:220.0000,d3:233.0819,n2:233.0819,n3:246.9417
+};
+
+function _centsToRatio(cents) { return Math.pow(2, cents / 1200); }
+
+function _tokenToFreq(token, srutiFactor) {
+  if (!token) return null;
+  let octave = 1, key = token;
+  if (key.startsWith("L_")) { octave = 0.5; key = key.slice(2); }
+  if (key === key.toUpperCase() && key.length > 0) octave = 2;
+  key = key.toLowerCase();
+  const base = _GAMAKAM_BASE_FREQS[key];
+  if (!base) return null;
+  return base * octave * srutiFactor;
+}
+
+class GamakamEngine {
+  constructor(ctx, masterGain) {
+    this.ctx = ctx;
+    this.masterGain = masterGain;
+  }
+
+  scheduleNote(freq, startTime, durSec, profile) {
+    if (!freq || durSec <= 0) return;
+    const ctx = this.ctx;
+    const g = ctx.createGain();
+    g.connect(this.masterGain);
+
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    osc1.type = "sawtooth"; osc2.type = "triangle";
+    osc1.frequency.value = freq;
+    osc2.frequency.value = freq * 2;
+
+    const g1 = ctx.createGain(); g1.gain.value = 0.65;
+    const g2 = ctx.createGain(); g2.gain.value = 0.35;
+    osc1.connect(g1).connect(g);
+    osc2.connect(g2).connect(g);
+
+    const t0 = startTime, t_end = t0 + durSec;
+    g.gain.setValueAtTime(0.001, t0);
+    g.gain.linearRampToValueAtTime(0.7, t0 + Math.min(0.12, durSec * 0.15));
+    g.gain.setValueAtTime(0.6, t0 + durSec * 0.70);
+    g.gain.linearRampToValueAtTime(0.001, t_end + 0.12);
+
+    if (profile && profile.type !== "none") {
+      this._applyToOsc(osc1, osc2, freq, t0, durSec, profile);
+    }
+
+    osc1.start(t0); osc2.start(t0);
+    const stopT = t_end + 0.18;
+    osc1.stop(stopT); osc2.stop(stopT);
+    osc2.onended = () => { try { g.disconnect(); } catch (_) {} };
+  }
+
+  _applyToOsc(osc1, osc2, freq, t0, durSec, profile) {
+    switch (profile.type) {
+      case "kampita":    this._kampita(osc1, osc2, freq, t0, durSec, profile); break;
+      case "meend_up":   this._meendUp(osc1, osc2, freq, t0, profile);         break;
+      case "meend_down": this._meendDown(osc1, osc2, freq, t0, durSec, profile); break;
+      case "sphurita":   this._sphurita(osc1, osc2, freq, t0, profile);        break;
+      case "andola":     this._andola(osc1, osc2, freq, t0, durSec, profile);  break;
+    }
+  }
+
+  _kampita(osc1, osc2, base, t0, dur, p) {
+    const delay  = (p.delayMs ?? 80) / 1000;
+    const depth  = _centsToRatio(p.depthCents ?? 50);
+    const period = 1 / (p.rateHz ?? 5);
+    const tStart = t0 + delay, tEnd = t0 + dur;
+
+    // Anchor both oscillators to base frequency before delay
+    osc1.frequency.setValueAtTime(base,     t0);
+    osc2.frequency.setValueAtTime(base * 2, t0);
+
+    let t = tStart;
+    while (t + period < tEnd) {
+      // Asymmetric: 30% up, 70% down — Carnatic kampita biases toward lower pitch
+      osc1.frequency.linearRampToValueAtTime(base * depth,     t + period * 0.30);
+      osc1.frequency.linearRampToValueAtTime(base / depth,     t + period * 0.70);
+      osc1.frequency.linearRampToValueAtTime(base,             t + period);
+      osc2.frequency.linearRampToValueAtTime(base * depth * 2, t + period * 0.30);
+      osc2.frequency.linearRampToValueAtTime(base / depth * 2, t + period * 0.70);
+      osc2.frequency.linearRampToValueAtTime(base * 2,         t + period);
+      t += period;
+    }
+    // Always return to exact base at note end — no dangling ramp
+    osc1.frequency.linearRampToValueAtTime(base,     tEnd);
+    osc2.frequency.linearRampToValueAtTime(base * 2, tEnd);
+  }
+
+  _meendUp(osc1, osc2, base, t0, p) {
+    const fromFreq = base * _centsToRatio(p.fromOffsetCents ?? -100);
+    const slideDur = (p.durationMs ?? 130) / 1000;
+    // Start below pitch, slide up to base
+    osc1.frequency.setValueAtTime(fromFreq,     t0);
+    osc1.frequency.exponentialRampToValueAtTime(base,     t0 + slideDur);
+    osc1.frequency.setValueAtTime(base,          t0 + slideDur); // anchor — prevents drift after slide
+    osc2.frequency.setValueAtTime(fromFreq * 2, t0);
+    osc2.frequency.exponentialRampToValueAtTime(base * 2, t0 + slideDur);
+    osc2.frequency.setValueAtTime(base * 2,      t0 + slideDur); // anchor
+  }
+
+  _meendDown(osc1, osc2, base, t0, dur, p) {
+    const toFreq     = base * _centsToRatio(p.toOffsetCents ?? -80);
+    const slideDur   = (p.durationMs ?? 110) / 1000;
+    const slideStart = t0 + dur - slideDur;
+    // Anchor to base at note start — ensures clean start regardless of prior gamakam state
+    osc1.frequency.setValueAtTime(base,     t0);
+    osc2.frequency.setValueAtTime(base * 2, t0);
+    // Hold base until slide begins, then ramp down
+    osc1.frequency.setValueAtTime(base,     slideStart);
+    osc1.frequency.exponentialRampToValueAtTime(toFreq,     t0 + dur);
+    osc2.frequency.setValueAtTime(base * 2, slideStart);
+    osc2.frequency.exponentialRampToValueAtTime(toFreq * 2, t0 + dur);
+  }
+
+  _sphurita(osc1, osc2, base, t0, p) {
+    const upper = base * _centsToRatio(p.aboveCents ?? 100);
+    const dur   = (p.durationMs ?? 65) / 1000;
+    osc1.frequency.setValueAtTime(upper,     t0);
+    osc1.frequency.exponentialRampToValueAtTime(base,     t0 + dur);
+    osc2.frequency.setValueAtTime(upper * 2, t0);
+    osc2.frequency.exponentialRampToValueAtTime(base * 2, t0 + dur);
+  }
+
+  _andola(osc1, osc2, base, t0, dur, p) {
+    const delay  = (p.delayMs ?? 0) / 1000;
+    const depth  = _centsToRatio(p.depthCents ?? 120);
+    const period = 1 / (p.rateHz ?? 2.5);
+    const tStart = t0 + delay, tEnd = t0 + dur;
+
+    // Anchor to base at t0 (holds through the delay)
+    osc1.frequency.setValueAtTime(base,     t0);
+    osc2.frequency.setValueAtTime(base * 2, t0);
+
+    let t = tStart;
+    while (t + period < tEnd) {
+      osc1.frequency.linearRampToValueAtTime(base * depth,     t + period * 0.30);
+      osc1.frequency.linearRampToValueAtTime(base / depth,     t + period * 0.70);
+      osc1.frequency.linearRampToValueAtTime(base,             t + period);
+      osc2.frequency.linearRampToValueAtTime(base * depth * 2, t + period * 0.30);
+      osc2.frequency.linearRampToValueAtTime(base / depth * 2, t + period * 0.70);
+      osc2.frequency.linearRampToValueAtTime(base * 2,         t + period);
+      t += period;
+    }
+    // Close any partial cycle — always land on base at note end
+    osc1.frequency.linearRampToValueAtTime(base,     tEnd);
+    osc2.frequency.linearRampToValueAtTime(base * 2, tEnd);
+  }
+}
+
+/* ── Edge function fetch helper ──────────────────────────────────────────── */
+const GAMAKAM_EF_URL = 'https://wcpbbvurfbraqqqlpsro.supabase.co/functions/v1/get-gamakam';
+
+async function _fetchGamakamQueue(mode, payload) {
+  const sb = window.__appUser?.supabase;
+  if (!sb) throw new Error('[Gamakam] Supabase not available');
+  const { data: sessData } = await sb.auth.getSession();
+  const token = sessData?.session?.access_token;
+  if (!token) throw new Error('[Gamakam] No auth token');
+  const res = await fetch(GAMAKAM_EF_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${token}`,
+      'apikey':        SUPABASE_ANON,
+    },
+    body: JSON.stringify({ mode, ...payload }),
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(`[Gamakam] EF ${res.status}: ${err}`); }
+  return res.json();
+}
+
+/* ── playJanyaWithGamakam ────────────────────────────────────────────────── */
+//
+// Beat-duration logic for gamakam aro/ava:
+//   One swara = one beat = 60/bpm seconds.
+//   Gamakam types need minimum durations:
+//     kampita  @ 5 Hz  → 1 oscillation = 0.20 s  → need ≥ 0.50 s (2+ cycles)
+//     andola   @ 2.5Hz → 1 oscillation = 0.40 s  → need ≥ 0.60 s (1+ cycle)
+//     meend_up/down    → slide is 130 ms → rest of note is plain
+//     sphurita         → mordent is 65 ms → rest of note is plain
+//   At 60 BPM: 60/60 = 1.00 s per beat  — all types work
+//   At 80 BPM: 60/80 = 0.75 s per beat  — all types work
+//   At 100BPM: 60/100= 0.60 s per beat  — kampita & andola borderline, acceptable
+//
+// Per-swara duration override: swaras tagged with gamakam types kampita/andola
+// are given 1.5× the base duration so oscillations complete cleanly.
+// Sa and Pa (no gamakam, type "none") are given 0.75× — they are anchor notes.
+//
+async function playJanyaWithGamakam({ ragamId, arohanam, avarohanam, melakarta, srutiFactor, bpm, mySessionId }) {
+  let efData;
+  try {
+    efData = await _fetchGamakamQueue("aro_ava", { ragamId, arohanam, avarohanam, melakarta });
+  } catch (e) {
+    console.error('[Gamakam]', e.message);
+    return null; // caller falls back to plain playback
+  }
+
+  if (mySessionId !== playSessionId) return "STOP";
+
+  const ctx    = getAudioCtx();
+  const engine = new GamakamEngine(ctx, masterGain);
+
+  if (masterGain) {
+    masterGain.gain.cancelScheduledValues(ctx.currentTime);
+    masterGain.gain.setValueAtTime(0.9, ctx.currentTime);
+  }
+
+  // ── FIXED: one beat = 60/bpm seconds, not the varisai aksharam formula ──
+  // The old formula  (21.6 / bpm) * currentGati  was for varisai patterns
+  // where currentGati (4 or 3) subdivides each aksharam. For aro/ava each
+  // swara IS one beat — no subdivision needed.
+  const oneBeat = 60 / bpm;
+
+  // Duration multiplier per gamakam type so oscillations complete cleanly
+  function _noteDur(profileName) {
+    if (profileName === 'kampita') return oneBeat * 1.5;  // 2+ oscillation cycles
+    if (profileName === 'andola')  return oneBeat * 1.6;  // 1+ wide cycle
+    if (profileName === 'none')    return oneBeat * 0.85; // anchor notes slightly shorter
+    return oneBeat;                                        // meend_up/down, sphurita: 1 beat
+  }
+
+  let t = ctx.currentTime + 0.05;
+
+  for (const item of efData.playQueue) {
+    if (!isPlaying) return "STOP";
+    if (skipRequested) return "SKIP";
+
+    dynamicInfo.innerHTML = `<b>${item.label}</b>`;
+
+    const { swaras, freqOffsets, gamakamDefs } = item;
+
+    for (let i = 0; i < swaras.length; i++) {
+      const freq        = _tokenToFreq(swaras[i], srutiFactor);
+      const profileName = freqOffsets[i] ?? "none";
+      const profile     = gamakamDefs[profileName] ?? { type: "none" };
+      const durSec      = _noteDur(profileName);
+
+      if (freq) {
+        engine.scheduleNote(freq, t, durSec, profile);
+        if (typeof scoringOnNote === 'function') scoringOnNote(freq, durSec * 1000);
+      }
+      t += durSec;
+    }
+
+    // Gap between arohanam and avarohanam — one plain beat
+    t += oneBeat * 0.5;
+
+    const MIN_YIELD_MS = 8;
+    const rawRemaining = (t - ctx.currentTime) * 1000 - MIN_YIELD_MS;
+    await new Promise(r => setTimeout(r, Math.max(MIN_YIELD_MS, rawRemaining)));
+
+    if (!isPlaying) return "STOP";
+    if (skipRequested) return "SKIP";
+    if (!audioCtx || !masterGain) return "STOP";
+    if (mySessionId !== playSessionId) return "STOP";
+  }
+
+  return "DONE";
+}
+
+/* ── playSignaturePhrases ────────────────────────────────────────────────── */
+//
+// Plays the characteristic (pidi) phrases stored in ragams.swaras for a janya
+// ragam.  Called automatically after aro/ava gamakam playback completes.
+//
+// Profile merge strategy — inline phrase values win over the shared profile:
+//   profile = { ...allGamakamProfiles[gDef.type], ...gDef }
+// This lets stored phrases tune depthCents / rateHz per-context without
+// requiring a separate profile key in the edge function.
+//
+async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
+  if (!ragamId) return;
+  let efData;
+  try {
+    efData = await _fetchGamakamQueue('phrases', { ragamId });
+  } catch (e) {
+    console.error('[Gamakam] Phrase fetch failed:', e.message);
+    return;
+  }
+
+  const { phrases, allGamakamProfiles } = efData;
+  if (!phrases || phrases.length === 0) {
+    dynamicInfo.innerHTML = '<i>No signature phrases stored for this ragam yet.</i>';
+    return;
+  }
+
+  if (mySessionId !== playSessionId) return;
+
+  const ctx = getAudioCtx();
+  const engine = new GamakamEngine(ctx, masterGain);
+  if (masterGain) {
+    masterGain.gain.cancelScheduledValues(ctx.currentTime);
+    masterGain.gain.setValueAtTime(0.9, ctx.currentTime);
+  }
+
+  // one beat = 60/bpm seconds; duration_beats scales each swara relative to that.
+  const oneBeat = 60 / bpm;
+
+  // Minimum note duration for gamakam types that need time to complete their
+  // oscillation or slide — mirrors the logic in playJanyaWithGamakam._noteDur().
+  function _phraseDur(beatCount, profileType) {
+    const raw = oneBeat * (beatCount ?? 1);
+    if (profileType === 'kampita') return Math.max(raw, oneBeat * 1.5);
+    if (profileType === 'andola')  return Math.max(raw, oneBeat * 1.6);
+    return raw;
+  }
+
+  // Brief separator shown in the UI between aro/ava block and phrases
+  dynamicInfo.innerHTML = '<b>Characteristic Phrases</b>';
+  await new Promise(r => setTimeout(r, 300));
+
+  let t = ctx.currentTime + 0.05;
+
+  for (const phrase of phrases) {
+    if (!isPlaying || skipRequested || mySessionId !== playSessionId) break;
+
+    dynamicInfo.innerHTML =
+      `<b>Phrase: ${phrase.name || phrase.id}</b>` +
+      `<span style="font-weight:normal;color:#666"> (${phrase.direction === 'aro' ? '\u2191' : '\u2193'})</span>`;
+
+    const { swaras, gamakam = [], duration_beats = [] } = phrase;
+
+    // Index gamakam entries by swara position for O(1) lookup
+    const gByIndex = {};
+    for (const g of gamakam) gByIndex[g.swara_index] = g;
+
+    for (let i = 0; i < swaras.length; i++) {
+      const freq  = _tokenToFreq(swaras[i], srutiFactor);
+      const gDef  = gByIndex[i];
+
+      // Merge: shared profile sets defaults; inline phrase values override them.
+      // Strip swara_index from the merged object — it is metadata, not an audio param.
+      let profile = { type: 'none' };
+      if (gDef) {
+        const base = allGamakamProfiles[gDef.type] ?? {};
+        const { swara_index: _drop, ...inlineParams } = gDef;
+        profile = { ...base, ...inlineParams };
+      }
+
+      const durSec = _phraseDur(duration_beats[i], profile.type);
+      if (freq) engine.scheduleNote(freq, t, durSec, profile);
+      t += durSec;
+    }
+
+    // One-beat gap between phrases — lets the last note ring and gives a
+    // rhythmic breath before the next phrase starts.
+    t += oneBeat;
+
+    const MIN_YIELD_MS = 8;
+    const rawRemaining = (t - ctx.currentTime) * 1000 - MIN_YIELD_MS;
+    await new Promise(r => setTimeout(r, Math.max(MIN_YIELD_MS, rawRemaining)));
+  }
+}

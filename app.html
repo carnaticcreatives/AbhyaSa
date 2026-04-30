@@ -276,7 +276,64 @@
     pointer-events: none;
   }
 
-  /* Tambura separator — visual gap between Janya and Tambura only */
+  /* ── Talam / Jati / Gati compact dropdown row ───────────────────────── */
+  .talam-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    margin-bottom: 10px;
+  }
+  .talam-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .talam-lbl {
+    font-size: 11px;
+    color: #7a6e58;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .talam-field select {
+    font-size: 13px;
+    font-family: inherit;
+    padding: 5px 8px;
+    border: 1px solid #c8bfa8;
+    border-radius: 3px;
+    background: #f9f5ed;
+    color: #2c2416;
+    cursor: pointer;
+  }
+
+  /* ── Talam beat dots — inline in Ragam Type row ─────────────────────── */
+  .talam-dots { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 3px; }
+
+  /* Individual beat dot */
+  .beat-dot {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #e8e0d0;
+    border: 1.5px solid #c8bfa8;
+    transition: background 0.07s, transform 0.07s, border-color 0.07s;
+    vertical-align: middle;
+  }
+  .beat-dot.sam { border-radius: 4px; }  /* square = sam */
+
+  /* Lit states */
+  .beat-dot.lit-sam      { background:#E24B4A; border-color:#A32D2D; transform:scale(1.18); }
+  .beat-dot.lit-laghu    { background:#378ADD; border-color:#185FA5; transform:scale(1.12); }
+  .beat-dot.lit-wave     { background:#1D9E75; border-color:#0F6E56; transform:scale(1.10); }
+  .beat-dot.lit-finger   { background:#888780; border-color:#5F5E5A; transform:scale(1.06); }
+  .beat-dot.lit-anudruta { background:#BA7517; border-color:#854F0B; transform:scale(1.06); }
+
+  /* Anga group separator inside the dots row */
+  .anga-gap { display:inline-block; width:6px; }
+
+  /* Tambura separator */
   .raga-type-sep {
     display: inline-block;
     width: 1px;
@@ -508,33 +565,24 @@
   </svg>
 </div>
 
+
+
+<!-- ── RAGAM TYPE + METRONOME DOTS — same row ────────────────────────────── -->
 <label>Ragam Type</label>
-<div class="raga-type">
-  <label>
-    <input type="radio" name="ragaType" value="sampoorna">
-    Sampoorna
-  </label>
-  <label>
-    <input type="radio" name="ragaType" value="audava">
-    Audava
-  </label>
-  <label>
-    <input type="radio" name="ragaType" value="shadava">
-    Shadava
-  </label>
-  <label>
-    <input type="radio" name="ragaType" value="janya">
-    Janya
-  </label>
+<div class="raga-type" style="display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
+  <label><input type="radio" name="ragaType" value="sampoorna"> Sampoorna</label>
+  <label><input type="radio" name="ragaType" value="audava"> Audava</label>
+  <label><input type="radio" name="ragaType" value="shadava"> Shadava</label>
+  <label><input type="radio" name="ragaType" value="janya"> Janya</label>
   <span class="raga-type-sep"></span>
-  <label>
-    <input type="radio" name="ragaType" value="tambura" checked>
-    Tambura only
-  </label>
+  <label><input type="radio" name="ragaType" value="tambura" checked> Tambura only</label>
   <span class="raga-type-sep"></span>
-  <label id="firstSpeedLabel" style="font-weight:normal; color:#555;">
+  <label id="firstSpeedLabel" style="font-weight:normal; color:#555; display:none;">
     <input type="checkbox" id="firstSpeedOnly"> 1st Speed only
   </label>
+  <span class="raga-type-sep"></span>
+  <!-- Metronome beat dots — inline, no legend -->
+  <span id="metronomeBeatDisplay" class="talam-dots" style="margin-left:4px;"></span>
 </div>
 
 <label>Ragam</label>
@@ -547,8 +595,7 @@
 <label>Varisai</label>
 <select id="varisai"></select>
 
-
-<div class="speed">
+<div class="speed" style="display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px;">
 
   <label><input type="radio" name="speed" value="60"> 60 BPM</label>
   <label><input type="radio" name="speed" value="80" checked> 80 BPM</label>
@@ -576,15 +623,62 @@
     <label>
       <input type="checkbox" id="metronomeOn" checked> Metronome
     </label>
-    <span id="metronomeBeatDisplay" style="display:none"></span>
   </div>
 
-  <div class="transport">
+  <!-- Variety — same row as Sruti/Metronome, matching label style -->
+  <div class="sruti-control">
+    <label for="varietySel">Variety:</label>
+    <select id="varietySel" onchange="onVarietyChange(this.value)">
+      <option value="normal">Normal</option>
+      <option value="firstSpeed">1st Speed only</option>
+      <option value="tala">Tala practice only</option>
+      <option value="tisram">Tisram singing</option>
+    </select>
+  </div>
+
+  <div class="transport" style="display:flex; align-items:center; gap:6px;">
     <button onclick="skipBackward()">⏮</button>
     <button onclick="togglePlay()">▶ / ⏹</button>
     <button onclick="skipForward()">⏭</button>
   </div>
 
+</div>
+
+<!-- Talam controls — shown only when Tala practice is selected in Variety dropdown -->
+<div id="talaPracticeControls" style="display:none; margin-top:6px; padding:8px 10px; background:#f5f0e8; border-radius:6px; border:1px solid #d4c9b0;">
+  <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center;">
+    <div class="talam-field">
+      <label class="talam-lbl">Talam</label>
+      <select id="tpTalamSel" onchange="onTpTalamChange(this.value)">
+        <option value="druva">Druva</option>
+        <option value="matya">Matya</option>
+        <option value="rupaka">Rupaka</option>
+        <option value="jhampa">Jhampa</option>
+        <option value="triputa" selected>Triputa</option>
+        <option value="ata">Ata</option>
+        <option value="eka">Eka</option>
+      </select>
+    </div>
+    <div class="talam-field">
+      <label class="talam-lbl">Jati</label>
+      <select id="tpJatiSel" onchange="onTpJatiChange(+this.value)">
+        <option value="3">Tisra (3)</option>
+        <option value="4" selected>Chatusra (4)</option>
+        <option value="5">Khanda (5)</option>
+        <option value="7">Misra (7)</option>
+        <option value="9">Sankeerna (9)</option>
+      </select>
+    </div>
+    <div class="talam-field">
+      <label class="talam-lbl">Gati (Nadai)</label>
+      <select id="tpGatiSel" onchange="onTpGatiChange(+this.value)">
+        <option value="3">Tisram (3) — tha ki ta</option>
+        <option value="4" selected>Chatusram (4) — tha ka dhi mi</option>
+        <option value="5">Kandam (5) — tha ka ta ki ta</option>
+        <option value="7">Misram (7) — tha ki ta tha ka dhi mi</option>
+      </select>
+    </div>
+  </div>
 </div>
 
 
