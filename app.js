@@ -2034,10 +2034,15 @@ async function searchJanyaRagams(query) {
   if (!sb) return [];
 
   const q = query.trim();
+
+  // pack field stores popularity tier: P1 (top ~50) → P2 (~100) → P3 (rest)
+  const TIER_ORDER = { 'P1': 1, 'P2': 2, 'P3': 3 };
+
   let req = sb
     .from('ragams')
-    .select('id, name, melakarta')   // deliberately exclude arohanam/avarohanam
+    .select('id, name, melakarta, pack')   // pack = popularity tier (P1/P2/P3)
     .eq('type', 'janya')
+    .order('pack', { ascending: true })    // P1 < P2 < P3 alphabetically
     .order('name', { ascending: true })
     .limit(60);
 
@@ -2047,7 +2052,14 @@ async function searchJanyaRagams(query) {
 
   const { data, error } = await req;
   if (error) { console.error('[Janya] Search error:', error.message); return []; }
-  return data || [];
+
+  // Re-sort client-side using explicit tier order in case DB ordering differs
+  return (data || []).sort((a, b) => {
+    const ta = TIER_ORDER[a.pack] ?? 9;
+    const tb = TIER_ORDER[b.pack] ?? 9;
+    if (ta !== tb) return ta - tb;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 /* ── Fetch full record for selected ragam (aro/ava only when needed) ──── */
@@ -2100,20 +2112,22 @@ function loadJanyaSearchUI() {
 /* ── Render search results in the dropdown ────────────────────────────── */
 async function renderJanyaResults(query) {
   const dd = document.getElementById('janyaDropdown');
-  dd.innerHTML = `<div class="jd-count">Searching…</div>`;
+  dd.innerHTML = '<div class="jd-count">Searching\u2026</div>';
   openJanyaDropdown();
 
   const results = await searchJanyaRagams(query);
 
   if (results.length === 0) {
-    dd.innerHTML = `<div class="jd-count">No ragams found</div>`;
+    dd.innerHTML = '<div class="jd-count">No ragams found</div>';
     return;
   }
 
   const q = query.trim().toLowerCase();
-  const countLine = q.length < 2
-    ? `<div class="jd-count">Showing first 60 — type 2+ letters to search</div>`
-    : `<div class="jd-count">${results.length} match${results.length !== 1 ? 'es' : ''} for "${query}"</div>`;
+  const isSearching = q.length >= 2;
+
+  const countLine = !isSearching
+    ? '<div class="jd-count">Showing first 60 \u2014 type 2+ letters to search</div>'
+    : '<div class="jd-count">' + results.length + ' match' + (results.length !== 1 ? 'es' : '') + ' for "' + query + '"</div>';
 
   const esc = s => s.replace(/[&<>"']/g, c =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -2123,16 +2137,34 @@ async function renderJanyaResults(query) {
     const idx = name.toLowerCase().indexOf(q);
     if (idx < 0) return esc(name);
     return esc(name.slice(0, idx)) +
-           `<mark>${esc(name.slice(idx, idx + q.length))}</mark>` +
+           '<mark>' + esc(name.slice(idx, idx + q.length)) + '</mark>' +
            esc(name.slice(idx + q.length));
   }
 
-  dd.innerHTML = countLine + results.map(r =>
-    `<div class="jd-item" data-id="${r.id}" data-name="${esc(r.name)}" data-mela="${r.melakarta}">
-       <span class="jd-name">${highlight(r.name)}</span>
-       <span class="jd-meta">Mela ${r.melakarta} · ${melakarta_dict[r.melakarta]?.[0] || ''}</span>
-     </div>`
-  ).join('');
+  const TIER_LABEL = { 'P1': '\u2B50 Popular', 'P2': 'Well Known', 'P3': 'All Ragams' };
+
+  let html = countLine;
+  let lastTier = null;
+
+  results.forEach(function(r) {
+    // Insert section header when tier changes (browse mode only)
+    if (!isSearching && r.pack !== lastTier) {
+      html += '<div class="jd-tier-header">' + (TIER_LABEL[r.pack] || r.pack) + '</div>';
+      lastTier = r.pack;
+    }
+
+    // Show tier badge inline during search
+    const tierBadge = isSearching
+      ? '<span class="jd-tier jd-tier-' + r.pack + '">' + r.pack + '</span>'
+      : '';
+
+    html += '<div class="jd-item" data-id="' + r.id + '" data-name="' + esc(r.name) + '" data-mela="' + r.melakarta + '">' +
+      '<span class="jd-name">' + highlight(r.name) + tierBadge + '</span>' +
+      '<span class="jd-meta">Mela ' + r.melakarta + ' \u00B7 ' + (melakarta_dict[r.melakarta]?.[0] || '') + '</span>' +
+      '</div>';
+  });
+
+  dd.innerHTML = html;
 
   dd.querySelectorAll('.jd-item').forEach(el => {
     el.addEventListener('mousedown', async e => {
