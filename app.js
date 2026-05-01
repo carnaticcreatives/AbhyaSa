@@ -829,6 +829,20 @@ let skipVarisai = false;
 /* === JANYA RAGAM: ARO + AVA ONLY === */
 if (ragaType === "janya") {
 
+  // Derive Melakarta from the fetched record
+  const melaNo = currentJanyaRecord.melakarta;
+  const melaName = melakarta_dict[melaNo]?.[0] || "Unknown";
+
+  // Display info (Janya-specific) — always shown regardless of gamakam path
+  staticInfo.innerHTML =
+    `<b>Ragam:</b> ${ragamName}<br>` +
+    `<b>Melakarta Ragam:</b> ${melaName} (${melaNo})<br>` +
+    `<b>Arohanam:</b> ${aro}<br>` +
+    `<b>Avarohanam:</b> ${ava}<br>` +
+    `<span style="font-size:12px;color:#c0392b">
+      <b>The arohanam and avarohanam played here are only indicative. A raga’s true character cannot be conveyed through a simple scale; it emerges through characteristic phrases, gamakas, and nuanced rendition.<b>
+    </span>`;
+
   // Build play queue manually
   await startTanpura(srutiFactor);
 
@@ -860,16 +874,7 @@ if (ragaType === "janya") {
     { patternGroup: [ava], bpm: bpm, metronomeBpm: bpm, label: "Avarohanam", pid: 2 }
   ];
 
-// Derive Melakarta from the fetched record
-const melaNo = currentJanyaRecord.melakarta;
-const melaName = melakarta_dict[melaNo]?.[0] || "Unknown";
-
-// Display info (Janya-specific)
-staticInfo.innerHTML =
-  `<b>Ragam:</b> ${ragamName}<br>` +
-  `<b>Melakarta Ragam:</b> ${melaName} (${melaNo})<br>` +
-  `<b>Arohanam:</b> ${aro}<br>` +
-  `<b>Avarohanam:</b> ${ava}`;
+  //playPatternQueue();
 
   // Progress calculation
   totalNotes = 0;
@@ -2464,7 +2469,7 @@ async function playJanyaWithGamakam({ ragamId, arohanam, avarohanam, melakarta, 
     if (!isPlaying) return "STOP";
     if (skipRequested) return "SKIP";
 
-    dynamicInfo.innerHTML = `<b>${item.label}</b>`;
+    //dynamicInfo.innerHTML = `<b>${item.label}</b>`;
 
     const { swaras, freqOffsets, gamakamDefs } = item;
 
