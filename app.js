@@ -312,32 +312,43 @@ function stopTanpura() {
 
 
 function resolveAudavaPattern(pattern, ragamNotes) {
+  // ragamNotes has 5 entries for audava, 6 for shadava.
+  // Alankaram patterns use a1-a6 as positional placeholders:
+  //   a1-a5 = the ragam's own swaras in arohanam order
+  //   a6    = high-octave repetition of a1 (tara sthayi)
+  //           For audava (5 notes) ragamNotes[5] is undefined — derive it.
+  //   A1    = same as a6 (uppercase DSL token = tara sa)
+  const highOctaveA1 = ragamNotes[0] ? ragamNotes[0].toUpperCase() : ragamNotes[0];
+
   const map = {
     a1: ragamNotes[0],
     a2: ragamNotes[1],
     a3: ragamNotes[2],
     a4: ragamNotes[3],
     a5: ragamNotes[4],
-    a6: ragamNotes[5]
+    // a6: for audava (5-note), ragamNotes[5] is undefined — fall back to tara sa
+    a6: ragamNotes[5] !== undefined ? ragamNotes[5] : highOctaveA1,
   };
 
   return pattern.replace(/\b(a[1-6]|A1)\b/g, m =>
-    m === "A1" ? ragamNotes[0].toUpperCase() : map[m]
+    m === "A1" ? highOctaveA1 : (map[m] ?? m)
   );
 }
 
 function resolveAudavaPatternForDisplay(pattern, ragamNotes) {
+  const highOctaveA1 = ragamNotes[0] ? ragamNotes[0].toUpperCase() : ragamNotes[0];
+
   const map = {
     a1: ragamNotes[0],
     a2: ragamNotes[1],
     a3: ragamNotes[2],
     a4: ragamNotes[3],
     a5: ragamNotes[4],
-    a6: ragamNotes[5]
+    a6: ragamNotes[5] !== undefined ? ragamNotes[5] : highOctaveA1,
   };
 
   return pattern.replace(/\b(a[1-6]|A1)\b/g, m =>
-    m === "A1" ? ragamNotes[0].toUpperCase() : map[m]
+    m === "A1" ? highOctaveA1 : (map[m] ?? m)
   );
 }
 
@@ -784,7 +795,11 @@ let skipVarisai = false;
   const isTisram = (varisaiSelect?.value === 'Alankaram-Tisram');
 
   // ── Gati / talam for guided playback ─────────────────────────────────────
-  if (isTisramSinging) {
+  // Tisram gati (3) applies for BOTH:
+  //   • isTisramSinging — the "Tisram singing" variety dropdown
+  //   • isTisram        — "Alankaram-Tisram" varisai (audava/shadava/sampoorna)
+  // Without this, Alankaram-Tisram patterns play at Chatusram speed (too fast/slow).
+  if (isTisramSinging || isTisram) {
     currentTalamKey = "triputa";
     currentGati     = 3;    // Tisram: 3 matras per aksharam
     currentJati     = 4;
@@ -1453,7 +1468,7 @@ function _metronomeClick(ctx, t, accent) {
 
 const GATI_MATRAS = { 3: 3, 4: 4, 5: 5, 7: 7 };
 
-function startMetronome(ctx, baseBpm, gati, startTime, forceTalam = false, tisramSinging = false) {
+function startMetronome(ctx, baseBpm, gati, startTime, forceTalam = false, tisramSinging = false, matraClicks = false) {
   stopMetronome();
   if (!isMetronomeEnabled(forceTalam)) return;
 
@@ -1492,6 +1507,15 @@ function startMetronome(ctx, baseBpm, gati, startTime, forceTalam = false, tisra
       if (tisramSinging) {
         if (t + matraDur     < _metronomeEndTime) _gatiSubClick(ctx, t + matraDur);
         if (t + matraDur * 2 < _metronomeEndTime) _gatiSubClick(ctx, t + matraDur * 2);
+      }
+
+      // Tala practice matra clicks: fire (gati-1) sub-clicks, one per matra
+      // subdivision within the aksharam. Works for any gati (3/4/5/7).
+      if (matraClicks && !tisramSinging && gati > 1) {
+        for (let m = 1; m < gati; m++) {
+          const tm = t + matraDur * m;
+          if (tm < _metronomeEndTime) _gatiSubClick(ctx, tm);
+        }
       }
 
       const delay = Math.max(0, (t - now) * 1000);
@@ -1732,8 +1756,10 @@ async function practiceMode_TalamOnly(srutiFactor) {
 
   buildBeatDots();
 
+  const matraClicks = document.getElementById('tpMatraClicks')?.checked || false;
+
   const ctx = getAudioCtx();
-  startMetronome(ctx, bpmVal, currentGati, ctx.currentTime + 0.1, true);
+  startMetronome(ctx, bpmVal, currentGati, ctx.currentTime + 0.1, true, false, matraClicks);
 
   staticInfo.innerHTML =
     `<b>Tala Practice</b> &nbsp;·&nbsp; ${talamLabel} &nbsp;·&nbsp; ${gatiNames[currentGati] || currentGati} gati` +

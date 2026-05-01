@@ -260,6 +260,22 @@
   #ud-sruti-save:hover { background: #6e2409; }
   #ud-sruti-msg { font-size: 11px; color: #2a8a3a; margin-top: 4px; display: none; }
 
+  /* BPM sub-row inside dropdown */
+  #ud-bpm-row {
+    display: none;
+    padding: 8px 14px 12px 38px;
+    background: #faf7f2;
+    border-bottom: 1px solid #f0ead8;
+  }
+  #ud-bpm-row.open { display: block; }
+  #ud-bpm-row label { font-size: 12px; color: #7a6e58; display: block; margin-bottom: 5px; }
+  #ud-default-bpm-select {
+    width: 100%; padding: 5px 8px; font-size: 13px;
+    border: 1px solid #d4c9a8; border-radius: 3px;
+    background: #fff; color: #2c2416;
+  }
+  #ud-bpm-msg { font-size: 11px; color: #2a8a3a; margin-top: 4px; display: none; }
+
   /* ── AbhyaSa logo header band ────────────────────────────────────────── */
   #app-logo-header {
     background: #8b2e0f;
@@ -496,6 +512,20 @@
       <button id="ud-sruti-save" onclick="saveDefaultSruti()">Save</button>
       <div id="ud-sruti-msg">✓ Saved</div>
     </div>
+
+    <!-- 3b. Default BPM (expands inline) -->
+    <div class="udrop-item" onclick="toggleBpmRow()">
+      <span class="ud-icon">🥁</span> Default BPM
+    </div>
+    <div id="ud-bpm-row">
+      <label for="ud-default-bpm-select">Set your default BPM:</label>
+      <select id="ud-default-bpm-select" onchange="applyBpmFromMenu(this.value)">
+        <option value="60">60 BPM</option>
+        <option value="80" selected>80 BPM</option>
+        <option value="100">100 BPM</option>
+      </select>
+      <div id="ud-bpm-msg">✓ Applied</div>
+    </div>
     
     <div class="udrop-divider"></div>
     <!-- 4. About -->
@@ -567,7 +597,7 @@
 
 
 
-<!-- ── RAGAM TYPE + METRONOME DOTS — same row ────────────────────────────── -->
+<!-- ── RAGAM TYPE + VARIETY — same row ───────────────────────────────────── -->
 <label>Ragam Type</label>
 <div class="raga-type" style="display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
   <label><input type="radio" name="ragaType" value="sampoorna"> Sampoorna</label>
@@ -577,12 +607,15 @@
   <span class="raga-type-sep"></span>
   <label><input type="radio" name="ragaType" value="tambura" checked> Tambura only</label>
   <span class="raga-type-sep"></span>
-  <label id="firstSpeedLabel" style="font-weight:normal; color:#555; display:none;">
-    <input type="checkbox" id="firstSpeedOnly"> 1st Speed only
-  </label>
-  <span class="raga-type-sep"></span>
-  <!-- Metronome beat dots — inline, no legend -->
-  <span id="metronomeBeatDisplay" class="talam-dots" style="margin-left:4px;"></span>
+  <div class="sruti-control">
+    <label for="varietySel">Variety:</label>
+    <select id="varietySel" onchange="onVarietyChange(this.value)">
+      <option value="normal">Normal</option>
+      <option value="firstSpeed">1st Speed only</option>
+      <option value="tala">Tala practice only</option>
+      <option value="tisram">Tisram singing</option>
+    </select>
+  </div>
 </div>
 
 <label>Ragam</label>
@@ -597,9 +630,18 @@
 
 <div class="speed" style="display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px;">
 
-  <label><input type="radio" name="speed" value="60"> 60 BPM</label>
-  <label><input type="radio" name="speed" value="80" checked> 80 BPM</label>
-  <label><input type="radio" name="speed" value="100"> 100 BPM</label>
+  <!-- Hidden BPM radios — read by app.js; selection controlled via the user menu dropdown -->
+  <div style="display:none;" aria-hidden="true">
+    <input type="radio" name="speed" value="60">
+    <input type="radio" name="speed" value="80" checked>
+    <input type="radio" name="speed" value="100">
+  </div>
+
+  <div class="transport" style="display:flex; align-items:center; gap:6px;">
+    <button onclick="skipBackward()">⏮</button>
+    <button onclick="togglePlay()">▶ / ⏹</button>
+    <button onclick="skipForward()">⏭</button>
+  </div>
 
   <div class="sruti-control">
     <label for="sruti">Sruti:</label>
@@ -619,27 +661,12 @@
     </select>
   </div>
 
-  <div class="metronome-control">
-    <label>
+  <div class="metronome-control" style="display:flex; align-items:center; gap:6px;">
+    <label style="display:flex; align-items:center; gap:4px;">
       <input type="checkbox" id="metronomeOn" checked> Metronome
     </label>
-  </div>
-
-  <!-- Variety — same row as Sruti/Metronome, matching label style -->
-  <div class="sruti-control">
-    <label for="varietySel">Variety:</label>
-    <select id="varietySel" onchange="onVarietyChange(this.value)">
-      <option value="normal">Normal</option>
-      <option value="firstSpeed">1st Speed only</option>
-      <option value="tala">Tala practice only</option>
-      <option value="tisram">Tisram singing</option>
-    </select>
-  </div>
-
-  <div class="transport" style="display:flex; align-items:center; gap:6px;">
-    <button onclick="skipBackward()">⏮</button>
-    <button onclick="togglePlay()">▶ / ⏹</button>
-    <button onclick="skipForward()">⏭</button>
+    <!-- Metronome beat dots — inline, right after the checkbox -->
+    <span id="metronomeBeatDisplay" class="talam-dots"></span>
   </div>
 
 </div>
@@ -678,6 +705,12 @@
         <option value="7">Misram (7) — tha ki ta tha ka dhi mi</option>
       </select>
     </div>
+    <div class="talam-field" style="justify-content:flex-end;">
+      <label class="talam-lbl">&nbsp;</label>
+      <label style="font-size:13px; font-weight:normal; display:flex; align-items:center; gap:5px; cursor:pointer;">
+        <input type="checkbox" id="tpMatraClicks"> Matra clicks
+      </label>
+    </div>
   </div>
 </div>
 
@@ -707,6 +740,10 @@
         <div id="about-modal">
           <button class="modal-close-x" onclick="document.getElementById('about-modal-overlay').classList.remove('open')">✕</button>
           <img src="abhyasa_flyer.png" alt="AbhyaSa flyer">
+          <div class="about-modal-footer">
+            <span class="about-version" id="about-version">…</span>
+            <button onclick="document.getElementById('about-modal-overlay').classList.remove('open')">Close</button>
+          </div>
         </div>
       `;
       overlay.addEventListener('click', e => {
@@ -784,6 +821,7 @@
     document.getElementById('user-menu-trigger').classList.remove('open');
     document.getElementById('user-dropdown').classList.remove('open');
     document.getElementById('ud-sruti-row').classList.remove('open');
+    document.getElementById('ud-bpm-row').classList.remove('open');
   }
 
   function toggleSrutiRow() {
@@ -792,6 +830,27 @@
     const savedSruti = window.__appUser?.defaultSruti || document.getElementById('sruti')?.value;
     if (savedSruti) document.getElementById('ud-default-sruti-select').value = savedSruti;
     row.classList.toggle('open');
+    // Close BPM row if open
+    document.getElementById('ud-bpm-row').classList.remove('open');
+  }
+
+  function toggleBpmRow() {
+    const row = document.getElementById('ud-bpm-row');
+    // Sync current speed selection
+    const currentSpeed = document.querySelector('input[name="speed"]:checked')?.value || '80';
+    const bpmSel = document.getElementById('ud-default-bpm-select');
+    if (bpmSel) bpmSel.value = currentSpeed;
+    row.classList.toggle('open');
+    // Close Sruti row if open
+    document.getElementById('ud-sruti-row').classList.remove('open');
+  }
+
+  function applyBpmFromMenu(val) {
+    // Apply the selected BPM to the hidden speed radio group
+    const radio = document.querySelector(`input[name="speed"][value="${val}"]`);
+    if (radio) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
+    const msg = document.getElementById('ud-bpm-msg');
+    if (msg) { msg.style.display = 'block'; setTimeout(() => { msg.style.display = 'none'; }, 1500); }
   }
 
   async function saveDefaultSruti() {
