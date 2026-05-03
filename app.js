@@ -2397,13 +2397,24 @@ class GamakamEngine {
     osc2.frequency.setValueAtTime(pts[0].f * 2, t0 + pts[0].tSec);
 
     for (let i = 1; i < pts.length; i++) {
-      const tAbs = t0 + pts[i].tSec;
-      const f    = pts[i].f;
-      // exponentialRamp requires f > 0 (it always is for musical pitches)
-      // It produces the natural curved glide a voice makes — linear ramps
-      // sound mechanical on pitch.
-      osc1.frequency.exponentialRampToValueAtTime(f,     tAbs);
-      osc2.frequency.exponentialRampToValueAtTime(f * 2, tAbs);
+      const curr = pts[i];
+      const tAbs = t0 + curr.tSec;
+
+      if (curr.hold) {
+        // 🎯 LAND + STAY
+        osc1.frequency.setValueAtTime(curr.f, tAbs);
+        osc2.frequency.setValueAtTime(curr.f * 2, tAbs);
+
+        // extend hold slightly
+        const holdDur = 0.15; // seconds (tune later)
+        osc1.frequency.setValueAtTime(curr.f, tAbs + holdDur);
+        osc2.frequency.setValueAtTime(curr.f * 2, tAbs + holdDur);
+
+      } else {
+        // 🎯 MOVE
+        osc1.frequency.exponentialRampToValueAtTime(curr.f, tAbs);
+        osc2.frequency.exponentialRampToValueAtTime(curr.f * 2, tAbs);
+      }
     }
 
     // Always anchor to last point's exact freq at t_end — prevents drift
@@ -2626,31 +2637,285 @@ async function playJanyaWithGamakam({ ragamId, arohanam, avarohanam, melakarta, 
   return "DONE";
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ *  PHRASE NOTATION ENGINE
+ *
+ *  A compact text notation encodes Carnatic phrases including duration,
+ *  grouping, and gamakam — then renders them as discrete notes (same
+ *  playPiano timbre as the rest of the app) with in-note pitch automation.
+ *
+ *  ── DURATION NOTATION ────────────────────────────────────────────────────
+ *  MATRA = base time unit (default 0.35s at alapana pace).
+ *  Each token occupies note_duration + 1-matra silence after it, EXCEPT
+ *  inside groups where there is no inter-note silence.
+ *
+ *    s        plain swaram — 1 matra note, then 1 matra silence
+ *    s,,      sustained   — (1 + N commas) matras note, then 1 matra silence
+ *    (s r g)  normal group — each 1 matra, NO gaps within, 1 matra after
+ *    {s r g}  fast group   — each 0.5 matra, NO gaps within, 1 matra after
+ *    |s r g|  glide group  — smooth pitch glide across all notes, 1 matra total
+ *
+ *  ── GAMAKAM SUFFIXES ─────────────────────────────────────────────────────
+ *  Appended directly to the swaram letter (before commas):
+ *
+ *    s~   kampita  — oscillate ±50c at 5Hz after 80ms settle
+ *    s^   nokku    — quick grace from +80c above, falls to pitch in 60ms
+ *    s_   meend_in — approach from 100c below, glide up to pitch over 120ms
+ *    s`   meend_out— pitch falls 80c in last 120ms of note
+ *
+ *  ── SAVERI PHRASES ───────────────────────────────────────────────────────
+ *    1. "s,, r m r~,, s,,"        saarmareeesaa
+ *    2. "p m r~,, s"              pmreees
+ *    3. "d_ d S,,,"               ddSaaa
+ *    4. "S n d p m g^ r~,, s,,"  Sandpmgreesaa
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+// All phrase data comes from ragams.swaras in the DB — nothing hardcoded here.
+
+// Swaram → cents from Sa
+// Full swara→cents map covering all 12 swara variants (12-ET approximation).
+// Single letters r/g/d/n default to the most common variants (R1/G3/D1/N3)
+// which matches Mela 15 (Saveri's parent). All other ragams use explicit
+// two-character tokens: r2, g2, m2, d2, n2 etc. in their notation strings.
+const SWARA_CENTS = {
+  s:  0,                          // Shadja
+  r:  90,  r1:  90,  r2: 200,     // Rishabha  (R1=suddha, R2=chatusruti)
+  g:  300, g1: 100,  g2: 300, g3: 400,  // Gandhara  (G2=sadharana, G3=antara)
+  m:  500, m1: 500,  m2: 600,     // Madhyama  (M1=suddha, M2=prati)
+  p:  700,                        // Panchama
+  d:  800, d1: 800,  d2: 900,     // Dhaivata  (D1=suddha, D2=chatusruti)
+  n:  1100,n1: 900,  n2:1000, n3:1100,  // Nishada   (N2=kaisika, N3=kakali)
+  S:  1200,                       // Upper Shadja
+};
+
+/* ── parsePhrase ────────────────────────────────────────────────────────────
+ *  Turns a notation string into an ordered array of note events.
+ *  Each event: { cents, noteDur, gap, gamakam }
+ *  noteDur and gap are in MATRAS (caller multiplies by MATRA seconds).
+ */
+function parsePhrase(notation, matra) {
+  const events = [];
+
+  // Tokenise: split on spaces, but keep group brackets intact
+  // Strategy: walk character by character collecting tokens
+  const str = notation.trim();
+  let i = 0;
+
+  while (i < str.length) {
+    // Skip spaces
+    if (str[i] === ' ') { i++; continue; }
+
+    // ── Normal group (s r g) ───────────────────────────────────────────────
+    if (str[i] === '(') {
+      const end = str.indexOf(')', i);
+      const inner = str.slice(i + 1, end).trim().split(/\s+/);
+      const notes = inner.map(tok => parseSwaramToken(tok));
+      // Each note: 1 matra, no gap within; 1 matra gap after last
+      for (let j = 0; j < notes.length; j++) {
+        events.push({ ...notes[j], noteDur: matra, gap: j === notes.length - 1 ? matra : 0 });
+      }
+      i = end + 1;
+      continue;
+    }
+
+    // ── Fast group {s r g} ─────────────────────────────────────────────────
+    if (str[i] === '{') {
+      const end = str.indexOf('}', i);
+      const inner = str.slice(i + 1, end).trim().split(/\s+/);
+      const notes = inner.map(tok => parseSwaramToken(tok));
+      // Each note: 0.5 matra, no gap within; 1 matra gap after last
+      for (let j = 0; j < notes.length; j++) {
+        events.push({ ...notes[j], noteDur: matra * 0.5, gap: j === notes.length - 1 ? matra : 0 });
+      }
+      i = end + 1;
+      continue;
+    }
+
+    // ── Glide group |s r g| ────────────────────────────────────────────────
+    if (str[i] === '|') {
+      const end = str.indexOf('|', i + 1);
+      const inner = str.slice(i + 1, end).trim().split(/\s+/);
+      const notes = inner.map(tok => parseSwaramToken(tok));
+      // Entire group = 1 matra, rendered as pitch glide
+      events.push({ cents: notes.map(n => n.cents), gamakam: 'glide', noteDur: matra, gap: matra });
+      i = end + 1;
+      continue;
+    }
+
+    // ── Plain swaram (possibly with gamakam suffix and commas) ────────────
+    // Collect until next space
+    let j = i;
+    while (j < str.length && str[j] !== ' ') j++;
+    const raw = str.slice(i, j);
+    i = j;
+
+    // Split off trailing commas (sustain markers)
+    let commas = 0;
+    let token = raw;
+    while (token.endsWith(',')) { commas++; token = token.slice(0, -1); }
+
+    const note = parseSwaramToken(token);
+    const noteDur = matra * (1 + commas);  // e.g. s,, = 3 matras
+    events.push({ ...note, noteDur, gap: matra });
+  }
+
+  return events;
+}
+
+/* ── parseSwaramToken ────────────────────────────────────────────────────── */
+function parseSwaramToken(token) {
+  // Extract gamakam suffix: ~  ^  _  `
+  let gamakam = 'none';
+  let sw = token;
+
+  // Check for suffix characters at the end
+  const GAMAKAM_CHARS = { '~': 'kampita', '^': 'nokku', '_': 'meend_in', '`': 'meend_out' };
+  for (const [ch, name] of Object.entries(GAMAKAM_CHARS)) {
+    if (sw.endsWith(ch)) { gamakam = name; sw = sw.slice(0, -1); break; }
+  }
+
+  const cents = SWARA_CENTS[sw];
+  if (cents === undefined) {
+    console.warn('[phraseEngine] Unknown swaram token:', sw);
+    return { cents: 0, gamakam: 'none' };
+  }
+  return { cents, gamakam };
+}
+
+/* ── playNote ───────────────────────────────────────────────────────────────
+ *  Plays a single discrete note at `freq` for `dur` seconds starting at
+ *  Web Audio time `t0`. Applies gamakam via AudioParam automation.
+ *  Same timbre as playPiano (sawtooth 0.65 + triangle 0.35, gain 0.7).
+ */
+function playNote(ctx, freq, dur, t0, gamakam) {
+  const gain = ctx.createGain();
+  gain.connect(masterGain);
+
+  // Identical envelope to playPiano
+  gain.gain.setValueAtTime(0.001,       t0);
+  gain.gain.linearRampToValueAtTime(0.7, t0 + 0.12);
+  gain.gain.setValueAtTime(0.6,          t0 + dur * 0.7);
+  gain.gain.linearRampToValueAtTime(0.001, t0 + dur + 0.15);
+
+  const osc1 = ctx.createOscillator(); osc1.type = 'sawtooth';
+  const osc2 = ctx.createOscillator(); osc2.type = 'triangle';
+  const g1   = ctx.createGain();       g1.gain.value = 0.65;
+  const g2   = ctx.createGain();       g2.gain.value = 0.35;
+  osc1.connect(g1).connect(gain);
+  osc2.connect(g2).connect(gain);
+
+  // ── Gamakam: pitch automation on osc1 (osc2 tracks ×2) ──────────────────
+  const f = freq;
+
+  // Helper: set both oscs at same time
+  const setF = (hz, t)  => { osc1.frequency.setValueAtTime(hz, t);          osc2.frequency.setValueAtTime(hz * 2, t); };
+  const rampF = (hz, t) => { osc1.frequency.linearRampToValueAtTime(hz, t); osc2.frequency.linearRampToValueAtTime(hz * 2, t); };
+
+  if (gamakam === 'none') {
+    setF(f, t0);
+
+  } else if (gamakam === 'kampita') {
+    // Settle at pitch for 80ms, then oscillate ±50 cents at 5Hz
+    const DEPTH = f * (Math.pow(2, 50 / 1200) - 1); // 50 cents in Hz
+    const PERIOD = 1 / 5;    // 5Hz
+    const SETTLE = 0.08;
+    setF(f, t0);
+    setF(f, t0 + SETTLE);
+    let tc = t0 + SETTLE;
+    while (tc + PERIOD < t0 + dur - 0.05) {
+      rampF(f + DEPTH, tc + PERIOD * 0.3);
+      rampF(f - DEPTH, tc + PERIOD * 0.7);
+      rampF(f,         tc + PERIOD);
+      tc += PERIOD;
+    }
+    rampF(f, t0 + dur - 0.05);  // settle back at end
+
+  } else if (gamakam === 'nokku') {
+    // Start 80 cents above, drop to pitch over 60ms
+    const above = f * Math.pow(2, 80 / 1200);
+    setF(above, t0);
+    rampF(f, t0 + 0.06);
+
+  } else if (gamakam === 'meend_in') {
+    // Start 100 cents below, rise to pitch over 120ms
+    const below = f * Math.pow(2, -100 / 1200);
+    setF(below, t0);
+    rampF(f, t0 + 0.12);
+
+  } else if (gamakam === 'meend_out') {
+    // Hold pitch, drop 80 cents in last 120ms
+    const below = f * Math.pow(2, -80 / 1200);
+    setF(f, t0);
+    setF(f, t0 + dur - 0.12);
+    rampF(below, t0 + dur);
+  }
+
+  osc1.start(t0); osc2.start(t0);
+  const stopT = t0 + dur + 0.2;
+  osc1.stop(stopT); osc2.stop(stopT);
+  osc2.onended = () => { try { gain.disconnect(); } catch (_) {} };
+}
+
+/* ── playGlide ──────────────────────────────────────────────────────────────
+ *  Plays a pitch glide across an array of cent values over `dur` seconds.
+ *  Uses a single oscillator with exponentialRamp between pitches.
+ */
+function playGlide(ctx, centsList, srutiSaHz, dur, t0) {
+  const gain = ctx.createGain();
+  gain.connect(masterGain);
+  gain.gain.setValueAtTime(0.001, t0);
+  gain.gain.linearRampToValueAtTime(0.7,   t0 + 0.04);
+  gain.gain.linearRampToValueAtTime(0.001, t0 + dur + 0.1);
+
+  const osc1 = ctx.createOscillator(); osc1.type = 'sawtooth';
+  const osc2 = ctx.createOscillator(); osc2.type = 'triangle';
+  const g1   = ctx.createGain(); g1.gain.value = 0.65;
+  const g2   = ctx.createGain(); g2.gain.value = 0.35;
+  osc1.connect(g1).connect(gain);
+  osc2.connect(g2).connect(gain);
+
+  const freqs = centsList.map(c => Math.max(20, srutiSaHz * Math.pow(2, c / 1200)));
+  const step = dur / (centsList.length - 1);
+
+  osc1.frequency.setValueAtTime(freqs[0],     t0);
+  osc2.frequency.setValueAtTime(freqs[0] * 2, t0);
+  for (let i = 1; i < freqs.length; i++) {
+    const tAbs = t0 + i * step;
+    osc1.frequency.exponentialRampToValueAtTime(freqs[i],     tAbs);
+    osc2.frequency.exponentialRampToValueAtTime(freqs[i] * 2, tAbs);
+  }
+
+  osc1.start(t0); osc2.start(t0);
+  const stopT = t0 + dur + 0.15;
+  osc1.stop(stopT); osc2.stop(stopT);
+  osc2.onended = () => { try { gain.disconnect(); } catch (_) {} };
+}
+
 /* ── playSignaturePhrases ────────────────────────────────────────────────── */
 //
-// Plays characteristic (pidi) phrases stored in ragams.swaras for a janya ragam.
-// Called automatically after aro/ava gamakam playback completes.
+//  Universal phrase player — works for ALL ragams.
+//  Fetches phrases from ragams.swaras via the get-gamakam edge function.
 //
-// Two phrase formats are supported — detected automatically per phrase:
+//  Phrase formats supported (detected per-phrase):
 //
-//   FORMAT A — curve (new, preferred)
-//     phrase.curve = [{t: ms, c: cents_from_sruti}, ...]
-//     phrase.meta  = { humanize: {timeFrac, cents} }   ← optional
-//     Played via scheduleCurve(): ONE oscillator for the whole phrase,
-//     pitch driven continuously by AudioParam automation.
-//     This is what makes it sound like a voice/violin rather than a keyboard.
+//    FORMAT A — notation string (preferred, new)
+//      phrase.notation = "s,, r m r~,, s,,"
+//      Parsed by parsePhrase() → discrete notes + gamakam via playNote()
+//      Notation rules:
+//        s       plain swaram, 1 matra note + 1 matra silence
+//        s,,     sustained: (1+N commas) matras note + 1 matra silence
+//        (s r g) normal group: each 1 matra, no internal gaps, 1 matra after
+//        {s r g} fast group:   each 0.5 matra, no internal gaps, 1 matra after
+//        |s r g| glide group:  pitch glide across all, 1 matra total
+//        s~  kampita   s^  nokku   s_  meend_in   s`  meend_out
 //
-//   FORMAT B — discrete (legacy fallback)
-//     phrase.swaras + phrase.gamakam + phrase.duration_beats
-//     Played via scheduleNote() per swara — the original path.
-//     Still used for aro/ava and for ragams that haven't been given curves yet.
-//
-// The edge function returns whichever formats are stored in ragams.swaras.
-// If render_v2.phrases exist they are preferred; otherwise phrases[] is used.
-// Both can coexist — no migration needed for existing data.
+//    FORMAT B — legacy discrete (swaras[] + gamakam[] + duration_beats[])
+//      Played via GamakamEngine.scheduleNote() — unchanged from before.
 //
 async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
   if (!ragamId) return;
+
+  // ── Fetch phrases from DB ─────────────────────────────────────────────────
   let efData;
   try {
     efData = await _fetchGamakamQueue('phrases', { ragamId });
@@ -2659,7 +2924,7 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
     return;
   }
 
-  // Prefer render_v2 phrases (curve format) if present; fall back to legacy phrases
+  // Prefer render_v2.phrases if present, fall back to legacy phrases[]
   const phrases = (efData.render_v2?.phrases?.length > 0)
     ? efData.render_v2.phrases
     : efData.phrases;
@@ -2669,120 +2934,101 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
     return;
   }
 
-  const allGamakamProfiles = efData.allGamakamProfiles ?? {};
-
   if (mySessionId !== playSessionId) return;
 
-  const ctx = getAudioCtx();
-  const engine = new GamakamEngine(ctx, masterGain);
+  // ── Audio context setup ───────────────────────────────────────────────────
+  const ctx       = getAudioCtx();
+  const srutiSaHz = _GAMAKAM_BASE_FREQS['s'] * srutiFactor;
+
   if (masterGain) {
     masterGain.gain.cancelScheduledValues(ctx.currentTime);
     masterGain.gain.setValueAtTime(0.9, ctx.currentTime);
   }
 
-  // oneBeat: the base time unit. duration_beats in curve phrases are seconds
-  // measured from the reference recording at ~60 BPM. We scale to user BPM.
-  const oneBeat    = 60 / bpm;
-  // bpmScale: ratio between user's BPM and the 60 BPM reference the curves
-  // were measured at. A curve measured at 60 BPM = 1.0× ; at 80 BPM = 0.75×.
-  const bpmScale   = 60 / bpm;
+  // MATRA: base time unit for notation-format phrases (alapana pace)
+  const MATRA   = 0.35;
+  // GAP_SEC: silence between phrases (musical breathing space)
+  const GAP_SEC = 1.2;
 
-  // ── _curveFreqs: convert a curve's cents to absolute frequencies ────────
-  // curve points use cents relative to sruti Sa (0 = Sa, 700 = Pa, etc.)
-  // srutiHz is the sruti-adjusted Sa frequency = _GAMAKAM_BASE_FREQS.s * srutiFactor
-  function _curveFreqs(curvePoints) {
-    const srutiHz = _GAMAKAM_BASE_FREQS['s'] * srutiFactor;
-    return curvePoints.map(pt => ({
-      // Scale time from the 60 BPM reference to user's BPM
-      tSec: (pt.t / 1000) * bpmScale,
-      f:    srutiHz * Math.pow(2, pt.c / 1200),
-    }));
-  }
+  // Legacy engine for FORMAT B phrases
+  const engine         = new GamakamEngine(ctx, masterGain);
+  const allGamakamProfiles = efData.allGamakamProfiles ?? {};
+  const oneBeat        = 60 / bpm;
+  const bpmScale       = (60 / bpm) * 2.5;
 
-  // ── _phraseDur: total wall-clock duration of a curve phrase ────────────
-  function _curveTotalSec(curvePoints) {
-    // Last point's timestamp (already scaled to user BPM in _curveFreqs)
-    // but we need the raw ms to scale here
-    const lastT = curvePoints[curvePoints.length - 1].t;
-    return (lastT / 1000) * bpmScale;
-  }
-
-  // ── _phraseDur (legacy discrete path) ──────────────────────────────────
-  function _phraseDur(beatCount, profileType) {
-    const raw = oneBeat * (beatCount ?? 1);
-    if (profileType === 'kampita') return Math.max(raw, oneBeat * 1.5);
-    if (profileType === 'andola')  return Math.max(raw, oneBeat * 1.6);
-    return raw;
-  }
-
-  // Brief separator shown in the UI between aro/ava block and phrases
-  dynamicInfo.innerHTML = '<b>Characteristic Phrases</b>';
+  const ragamDisplayName = currentJanyaRecord?.name ?? 'Ragam';
+  dynamicInfo.innerHTML = `<b>${ragamDisplayName} — Characteristic Phrases</b>`;
   await new Promise(r => setTimeout(r, 300));
 
-  let t = ctx.currentTime + 0.05;
+  let t = ctx.currentTime + 0.2;
 
   for (const phrase of phrases) {
     if (!isPlaying || skipRequested || mySessionId !== playSessionId) break;
 
-    const dirArrow = phrase.direction === 'aro' ? '↑' : '↓';
+    const displayName = phrase.name || phrase.id || '';
     dynamicInfo.innerHTML =
-      `<b>Phrase: ${phrase.name || phrase.id}</b>` +
-      `<span style="font-weight:normal;color:#666"> (${dirArrow})</span>`;
+      `<b>${ragamDisplayName}</b>` +
+      (displayName ? ` — <span style="font-weight:normal;color:#555">${displayName}</span>` : '');
 
-    // ════════════════════════════════════════════════════════════════════
-    //  FORMAT A — CURVE PHRASE
-    //  phrase.curve exists → use scheduleCurve() for continuous pitch
-    // ════════════════════════════════════════════════════════════════════
-    if (Array.isArray(phrase.curve) && phrase.curve.length >= 2) {
+    // ══════════════════════════════════════════════════════════════════════
+    //  FORMAT A — notation string
+    // ══════════════════════════════════════════════════════════════════════
+    if (typeof phrase.notation === 'string' && phrase.notation.trim().length > 0) {
 
-      const freqPts    = _curveFreqs(phrase.curve);
-      const totalSec   = _curveTotalSec(phrase.curve);
-      const humanize   = phrase.meta?.humanize ?? {};
+      const events = parsePhrase(phrase.notation, MATRA);
+      let phraseStart = t;
 
-      engine.scheduleCurve(freqPts, t, totalSec, {
-        timeFrac: humanize.timeFrac ?? 0.05,   // ±5% time jitter on interior points
-        cents:    humanize.cents    ?? 10,      // ±10 cents pitch jitter
-      });
+      for (const ev of events) {
+        if (!isPlaying || skipRequested || mySessionId !== playSessionId) break;
 
-      t += totalSec;
+        if (ev.gamakam === 'glide') {
+          playGlide(ctx, ev.cents, srutiSaHz, ev.noteDur, t);
+        } else {
+          const freq = Math.max(20, srutiSaHz * Math.pow(2, ev.cents / 1200));
+          playNote(ctx, freq, ev.noteDur, t, ev.gamakam);
+        }
+        t += ev.noteDur + ev.gap;
+      }
 
-    // ════════════════════════════════════════════════════════════════════
-    //  FORMAT B — LEGACY DISCRETE PHRASE
-    //  No curve field → fall back to per-swara scheduleNote()
-    // ════════════════════════════════════════════════════════════════════
+      t += GAP_SEC;
+
+      // Sleep until 200ms before phrase finishes, then schedule the next
+      const sleepMs = Math.max(8, (t - GAP_SEC - 0.2 - ctx.currentTime) * 1000);
+      await new Promise(r => setTimeout(r, sleepMs));
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  FORMAT B — legacy discrete (swaras[] + gamakam[] + duration_beats[])
+    // ══════════════════════════════════════════════════════════════════════
     } else {
 
       const { swaras = [], gamakam = [], duration_beats = [] } = phrase;
-
-      // Index gamakam entries by swara position for O(1) lookup
       const gByIndex = {};
       for (const g of gamakam) gByIndex[g.swara_index] = g;
 
       for (let i = 0; i < swaras.length; i++) {
         const freq = _tokenToFreq(swaras[i], srutiFactor);
         const gDef = gByIndex[i];
-
-        // Merge: shared profile defaults; inline phrase values override.
-        // Strip swara_index — it's metadata, not an audio param.
         let profile = { type: 'none' };
         if (gDef) {
           const baseProfile = allGamakamProfiles[gDef.type] ?? {};
           const { swara_index: _drop, ...inlineParams } = gDef;
           profile = { ...baseProfile, ...inlineParams };
         }
-
-        const durSec = _phraseDur(duration_beats[i], profile.type);
+        const raw = oneBeat * (duration_beats[i] ?? 1);
+        const durSec = (profile.type === 'kampita') ? Math.max(raw, oneBeat * 1.5)
+                     : (profile.type === 'andola')  ? Math.max(raw, oneBeat * 1.6)
+                     : raw;
         if (freq) engine.scheduleNote(freq, t, durSec, profile);
         t += durSec;
       }
+      t += oneBeat * 2.0;
+
+      const MIN_YIELD_MS = 8;
+      const rawRemaining = (t - ctx.currentTime) * 1000 - MIN_YIELD_MS;
+      await new Promise(r => setTimeout(r, Math.max(MIN_YIELD_MS, rawRemaining)));
     }
-
-    // One-beat breath between phrases — same for both formats.
-    // Lets the last note ring and gives rhythmic space before the next phrase.
-    t += oneBeat;
-
-    const MIN_YIELD_MS = 8;
-    const rawRemaining = (t - ctx.currentTime) * 1000 - MIN_YIELD_MS;
-    await new Promise(r => setTimeout(r, Math.max(MIN_YIELD_MS, rawRemaining)));
   }
+
+  dynamicInfo.innerHTML = `<b>${ragamDisplayName}</b>`;
 }
+
