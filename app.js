@@ -861,9 +861,16 @@ if (ragaType === "janya") {
   });
 
   if (_gamakamResult !== null) {
-    // Aro/ava gamakam ran — if it completed normally, follow up with
-    // the ragam's signature (pidi) phrases stored in ragams.swaras.
-    if (_gamakamResult === "DONE" && isPlaying && mySessionId === playSessionId) {
+    // Aro/ava gamakam ran — follow up with signature phrases unless the user
+    // explicitly stopped playback (isPlaying=false) or the session changed.
+    // "SKIP" means the user skipped past aro/ava — we still play phrases.
+    // "STOP" means isPlaying was set false — respect that and bail out.
+    const shouldPlayPhrases = (_gamakamResult === "DONE" || _gamakamResult === "SKIP")
+      && isPlaying
+      && mySessionId === playSessionId;
+
+    if (shouldPlayPhrases) {
+      skipRequested = false; // clear any skip flag so phrases play uninterrupted
       await playSignaturePhrases(selectedJanyaKey, srutiFactor, bpm, mySessionId);
     }
     // Clean up regardless of whether phrases ran or were skipped/stopped
@@ -2314,34 +2321,60 @@ class GamakamEngine {
   scheduleNote(freq, startTime, durSec, profile) {
     if (!freq || durSec <= 0) return;
     const ctx = this.ctx;
+
+    // ── Harmonium timbre — identical to playNote() ────────────────────────
+    // Was: sawtooth + triangle, osc2 at freq*2 (octave-double), no filter.
+    // Now: sawtooth + sawtooth 7¢ detune, lowpass 2200 Hz — same as playNote.
+    // This makes aro/ava (legacy PATH B) sound identical to phrase playback.
+    const filter = ctx.createBiquadFilter();
+    filter.type            = 'lowpass';
+    filter.frequency.value = 2200;
+    filter.Q.value         = 0.8;
+
     const g = ctx.createGain();
+    filter.connect(g);
     g.connect(this.masterGain);
 
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
-    osc1.type = "sawtooth"; osc2.type = "triangle";
+    osc1.type = 'sawtooth';
+    osc2.type = 'sawtooth';
+    osc2.detune.value = 7;   // 7¢ chorus warmth — not an octave doubler
+
     osc1.frequency.value = freq;
-    osc2.frequency.value = freq * 2;
+    osc2.frequency.value = freq;   // same pitch, detune handles spread
 
-    const g1 = ctx.createGain(); g1.gain.value = 0.65;
-    const g2 = ctx.createGain(); g2.gain.value = 0.35;
-    osc1.connect(g1).connect(g);
-    osc2.connect(g2).connect(g);
+    const g1 = ctx.createGain(); g1.gain.value = 0.60;
+    const g2 = ctx.createGain(); g2.gain.value = 0.40;
+    osc1.connect(g1).connect(filter);
+    osc2.connect(g2).connect(filter);
 
-    const t0 = startTime, t_end = t0 + durSec;
-    g.gain.setValueAtTime(0.001, t0);
-    g.gain.linearRampToValueAtTime(0.7, t0 + Math.min(0.12, durSec * 0.15));
-    g.gain.setValueAtTime(0.6, t0 + durSec * 0.70);
-    g.gain.linearRampToValueAtTime(0.001, t_end + 0.12);
+    const t0  = startTime;
+    const t_end = t0 + durSec;
+    const peakGain = (profile?.type === 'kampita' || profile?.type === 'andola') ? 0.58 : 0.55;
+    const atk      = Math.min(0.025, Math.max(0.008, durSec * 0.06));
+    const rel      = 0.015;
+
+    g.gain.setValueAtTime(0.001,           t0);
+    g.gain.exponentialRampToValueAtTime(peakGain,        t0 + atk);
+    g.gain.setValueAtTime(peakGain * 0.85,               t_end - rel);
+    g.gain.exponentialRampToValueAtTime(0.001,           t_end);
 
     if (profile && profile.type !== "none") {
+      // _applyToOsc still works correctly: it operates on osc1/osc2 frequency
+      // params directly, and osc2 is now a same-pitch chorus partner so the
+      // gamakam pitch curves (kampita, meend, andola) apply to both correctly.
       this._applyToOsc(osc1, osc2, freq, t0, durSec, profile);
+    } else {
+      // Plain note — set both oscillators to freq explicitly
+      osc1.frequency.setValueAtTime(freq, t0);
+      osc2.frequency.setValueAtTime(freq, t0);
     }
 
     osc1.start(t0); osc2.start(t0);
-    const stopT = t_end + 0.18;
+    const stopT = t_end + 0.02;
     osc1.stop(stopT); osc2.stop(stopT);
-    osc2.onended = () => { try { g.disconnect(); } catch (_) {} };
+    osc2.onended = () => { try { filter.disconnect(); g.disconnect(); } catch (_) {} };
   }
 
   // ── scheduleCurve ────────────────────────────────────────────────────────
@@ -2457,65 +2490,64 @@ class GamakamEngine {
     }
   }
 
+  // ── NOTE: osc2 is now a same-pitch chorus partner (7¢ detune), NOT an
+  //    octave doubler. All gamakam methods must drive osc2 at `base`, not
+  //    `base * 2`. The detune.value on osc2 provides the chorus spread — the
+  //    frequency automation here controls the fundamental pitch only.
+
   _kampita(osc1, osc2, base, t0, dur, p) {
     const delay  = (p.delayMs ?? 80) / 1000;
     const depth  = _centsToRatio(p.depthCents ?? 50);
     const period = 1 / (p.rateHz ?? 5);
     const tStart = t0 + delay, tEnd = t0 + dur;
 
-    // Anchor both oscillators to base frequency before delay
-    osc1.frequency.setValueAtTime(base,     t0);
-    osc2.frequency.setValueAtTime(base * 2, t0);
+    osc1.frequency.setValueAtTime(base, t0);
+    osc2.frequency.setValueAtTime(base, t0);
 
     let t = tStart;
     while (t + period < tEnd) {
-      // Asymmetric: 30% up, 70% down — Carnatic kampita biases toward lower pitch
-      osc1.frequency.linearRampToValueAtTime(base * depth,     t + period * 0.30);
-      osc1.frequency.linearRampToValueAtTime(base / depth,     t + period * 0.70);
-      osc1.frequency.linearRampToValueAtTime(base,             t + period);
-      osc2.frequency.linearRampToValueAtTime(base * depth * 2, t + period * 0.30);
-      osc2.frequency.linearRampToValueAtTime(base / depth * 2, t + period * 0.70);
-      osc2.frequency.linearRampToValueAtTime(base * 2,         t + period);
+      osc1.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
+      osc1.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
+      osc1.frequency.linearRampToValueAtTime(base,         t + period);
+      osc2.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
+      osc2.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
+      osc2.frequency.linearRampToValueAtTime(base,         t + period);
       t += period;
     }
-    // Always return to exact base at note end — no dangling ramp
-    osc1.frequency.linearRampToValueAtTime(base,     tEnd);
-    osc2.frequency.linearRampToValueAtTime(base * 2, tEnd);
+    osc1.frequency.linearRampToValueAtTime(base, tEnd);
+    osc2.frequency.linearRampToValueAtTime(base, tEnd);
   }
 
   _meendUp(osc1, osc2, base, t0, p) {
     const fromFreq = base * _centsToRatio(p.fromOffsetCents ?? -100);
     const slideDur = (p.durationMs ?? 130) / 1000;
-    // Start below pitch, slide up to base
-    osc1.frequency.setValueAtTime(fromFreq,     t0);
-    osc1.frequency.exponentialRampToValueAtTime(base,     t0 + slideDur);
-    osc1.frequency.setValueAtTime(base,          t0 + slideDur); // anchor — prevents drift after slide
-    osc2.frequency.setValueAtTime(fromFreq * 2, t0);
-    osc2.frequency.exponentialRampToValueAtTime(base * 2, t0 + slideDur);
-    osc2.frequency.setValueAtTime(base * 2,      t0 + slideDur); // anchor
+    osc1.frequency.setValueAtTime(fromFreq, t0);
+    osc1.frequency.exponentialRampToValueAtTime(base, t0 + slideDur);
+    osc1.frequency.setValueAtTime(base, t0 + slideDur);
+    osc2.frequency.setValueAtTime(fromFreq, t0);
+    osc2.frequency.exponentialRampToValueAtTime(base, t0 + slideDur);
+    osc2.frequency.setValueAtTime(base, t0 + slideDur);
   }
 
   _meendDown(osc1, osc2, base, t0, dur, p) {
     const toFreq     = base * _centsToRatio(p.toOffsetCents ?? -80);
     const slideDur   = (p.durationMs ?? 110) / 1000;
     const slideStart = t0 + dur - slideDur;
-    // Anchor to base at note start — ensures clean start regardless of prior gamakam state
-    osc1.frequency.setValueAtTime(base,     t0);
-    osc2.frequency.setValueAtTime(base * 2, t0);
-    // Hold base until slide begins, then ramp down
-    osc1.frequency.setValueAtTime(base,     slideStart);
-    osc1.frequency.exponentialRampToValueAtTime(toFreq,     t0 + dur);
-    osc2.frequency.setValueAtTime(base * 2, slideStart);
-    osc2.frequency.exponentialRampToValueAtTime(toFreq * 2, t0 + dur);
+    osc1.frequency.setValueAtTime(base,    t0);
+    osc2.frequency.setValueAtTime(base,    t0);
+    osc1.frequency.setValueAtTime(base,    slideStart);
+    osc1.frequency.exponentialRampToValueAtTime(toFreq, t0 + dur);
+    osc2.frequency.setValueAtTime(base,    slideStart);
+    osc2.frequency.exponentialRampToValueAtTime(toFreq, t0 + dur);
   }
 
   _sphurita(osc1, osc2, base, t0, p) {
     const upper = base * _centsToRatio(p.aboveCents ?? 100);
     const dur   = (p.durationMs ?? 65) / 1000;
-    osc1.frequency.setValueAtTime(upper,     t0);
-    osc1.frequency.exponentialRampToValueAtTime(base,     t0 + dur);
-    osc2.frequency.setValueAtTime(upper * 2, t0);
-    osc2.frequency.exponentialRampToValueAtTime(base * 2, t0 + dur);
+    osc1.frequency.setValueAtTime(upper, t0);
+    osc1.frequency.exponentialRampToValueAtTime(base, t0 + dur);
+    osc2.frequency.setValueAtTime(upper, t0);
+    osc2.frequency.exponentialRampToValueAtTime(base, t0 + dur);
   }
 
   _andola(osc1, osc2, base, t0, dur, p) {
@@ -2524,23 +2556,21 @@ class GamakamEngine {
     const period = 1 / (p.rateHz ?? 2.5);
     const tStart = t0 + delay, tEnd = t0 + dur;
 
-    // Anchor to base at t0 (holds through the delay)
-    osc1.frequency.setValueAtTime(base,     t0);
-    osc2.frequency.setValueAtTime(base * 2, t0);
+    osc1.frequency.setValueAtTime(base, t0);
+    osc2.frequency.setValueAtTime(base, t0);
 
     let t = tStart;
     while (t + period < tEnd) {
-      osc1.frequency.linearRampToValueAtTime(base * depth,     t + period * 0.30);
-      osc1.frequency.linearRampToValueAtTime(base / depth,     t + period * 0.70);
-      osc1.frequency.linearRampToValueAtTime(base,             t + period);
-      osc2.frequency.linearRampToValueAtTime(base * depth * 2, t + period * 0.30);
-      osc2.frequency.linearRampToValueAtTime(base / depth * 2, t + period * 0.70);
-      osc2.frequency.linearRampToValueAtTime(base * 2,         t + period);
+      osc1.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
+      osc1.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
+      osc1.frequency.linearRampToValueAtTime(base,         t + period);
+      osc2.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
+      osc2.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
+      osc2.frequency.linearRampToValueAtTime(base,         t + period);
       t += period;
     }
-    // Close any partial cycle — always land on base at note end
-    osc1.frequency.linearRampToValueAtTime(base,     tEnd);
-    osc2.frequency.linearRampToValueAtTime(base * 2, tEnd);
+    osc1.frequency.linearRampToValueAtTime(base, tEnd);
+    osc2.frequency.linearRampToValueAtTime(base, tEnd);
   }
 }
 
@@ -2795,132 +2825,128 @@ function parseSwaramToken(token) {
   return { cents, gamakam };
 }
 
-/* ── playNote ───────────────────────────────────────────────────────────────
- *  Plays a single discrete note at `freq` for `dur` seconds starting at
- *  Web Audio time `t0`. Applies gamakam via AudioParam automation.
- *
- *  UPGRADE (Option 2):
- *  Now fully matches GamakamEngine quality for Path A (render_v2 / sequenced_events).
- *  Changes vs the previous simple version:
- *
- *  1. kampita  — asymmetric 30%↑ / 70%↓ shape (Carnatic bias toward lower pitch),
- *                delay, depth and rate all tuned to match GamakamEngine._kampita().
- *                Previously: symmetric, fixed ±50c, no configurable parameters.
- *
- *  2. andola   — NEW. Wide slow oscillation (~2.5 Hz, ±120c) with initial delay.
- *                Used on sustained G3 and N3 in Poorvikalyani. Was missing entirely.
- *
- *  3. sphurita — NEW. Quick mordent: starts ~100c above, falls to pitch in 65ms.
- *                Maps to nokku-style ornament but from above, not a grace note.
- *                Previously absent; nokku was the only upper-approach gamakam.
- *
- *  4. nokku    — Grace from +80c, settles in 60ms. Unchanged in behaviour but
- *                now implemented via the same setF/rampF helpers for consistency.
- *
- *  5. meend_in — Approach from −100c below, glide up over 130ms (was 120ms,
- *                now matches GamakamEngine._meendUp default durationMs).
- *
- *  6. meend_out— Pitch falls −80c over last 110ms (was 120ms, matches
- *                GamakamEngine._meendDown default durationMs).
- *
- *  7. Gain envelope — attack now scales with dur (8% of note, min 30ms max 120ms)
- *                so short fast-group notes don't click and long nyasa notes
- *                breathe properly. Previously always 120ms flat.
- *
- *  8. fromFreq parameter (optional) — when provided, the oscillator starts at
- *                fromFreq instead of freq so consecutive notes share pitch state,
- *                producing legato between note events within a phrase.
- *                Callers that don't pass it get the original discrete behaviour.
- *
- *  The function signature gains one optional parameter: fromFreq.
- *  All existing call sites (playNote(ctx, freq, dur, t, gamakam)) are unaffected
- *  because fromFreq defaults to null.
- */
-function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null) {
+function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null, veenaMode = false) {
   const gain = ctx.createGain();
+
+  const filter = ctx.createBiquadFilter();
+  filter.connect(gain);
   gain.connect(masterGain);
 
-  // ── Gain envelope — attack proportional to note length ───────────────────
-  // kampita/andola notes get a touch more presence (0.72 vs 0.68).
-  const peakGain = (gamakam === 'kampita' || gamakam === 'andola') ? 0.72 : 0.68;
-  const atk      = Math.min(0.12, Math.max(0.03, dur * 0.08));
-  const rel      = Math.min(0.18, Math.max(0.05, dur * 0.12));
-  const CROSSFADE = 0.06;               // 60 ms overlap — note starts fading 60 ms early
-  const t_end     = t0 + dur;
-  const t_release = t_end - CROSSFADE; // release begins before t_end, not after
+  const osc1 = ctx.createOscillator();
+  const osc2 = ctx.createOscillator();
+  const g1   = ctx.createGain();
+  const g2   = ctx.createGain();
+  osc1.connect(g1).connect(filter);
+  osc2.connect(g2).connect(filter);
 
-  gain.gain.setValueAtTime(0.001,     t0);
-  gain.gain.linearRampToValueAtTime(peakGain,        t0 + atk);
-  gain.gain.setValueAtTime(peakGain * 0.88,           t_release - rel);
-  gain.gain.linearRampToValueAtTime(0.001,            t_release);   // ← reaches 0.001 AT t_end-CROSSFADE
+  const t_end = t0 + dur;
 
-  const osc1 = ctx.createOscillator(); osc1.type = 'sawtooth';
-  const osc2 = ctx.createOscillator(); osc2.type = 'triangle';
-  const g1   = ctx.createGain();       g1.gain.value = 0.65;
-  const g2   = ctx.createGain();       g2.gain.value = 0.35;
-  osc1.connect(g1).connect(gain);
-  osc2.connect(g2).connect(gain);
+  if (veenaMode) {
+    // ── Veena pluck timbre — UNCHANGED ─────────────────────────────────────
+    osc1.type      = 'sawtooth';
+    osc2.type      = 'triangle';
+    osc2.detune.value = 5;
+    g1.gain.value  = 0.60;
+    g2.gain.value  = 0.40;
 
-  // ── Pitch automation helpers ──────────────────────────────────────────────
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(3000, t0);
+    filter.frequency.exponentialRampToValueAtTime(800, t0 + 0.2);
+
+    gain.gain.setValueAtTime(0.001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.75,  t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.30,  t0 + 0.08);
+    gain.gain.exponentialRampToValueAtTime(0.001, t_end);
+
+    const noiseBuffer = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * 0.02), ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const noise     = ctx.createBufferSource();
+    noise.buffer    = noiseBuffer;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.25, t0);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.02);
+    noise.connect(noiseGain).connect(gain);
+    noise.start(t0);
+
+  } else {
+    // ── Harmonium timbre — CHANGED ──────────────────────────────────────────
+    // CHANGE 1: sawtooth+sawtooth with 7¢ detune (was triangle+sawtooth, octave doubler)
+    // CHANGE 2: lowpass at 2200Hz (was bandpass at 900Hz Q=1.4 — was killing the fundamental)
+    // CHANGE 3: exponential ramps, 15ms release (was linear, 120ms release overrunning the 20ms gap)
+
+    osc1.type         = 'sawtooth';
+    osc2.type         = 'sawtooth';
+    osc2.detune.value = 7;          // 7¢ chorus — warmth, not octave doubling
+    g1.gain.value     = 0.60;
+    g2.gain.value     = 0.40;
+
+    filter.type            = 'lowpass';
+    filter.frequency.value = 2200;
+    filter.Q.value         = 0.8;
+
+    const peakGain = (gamakam === 'kampita' || gamakam === 'andola') ? 0.58 : 0.55;
+    const atk      = Math.min(0.025, Math.max(0.008, dur * 0.06));
+    const rel      = 0.015;
+
+    gain.gain.setValueAtTime(0.001,           t0);
+    gain.gain.exponentialRampToValueAtTime(peakGain,        t0 + atk);
+    gain.gain.setValueAtTime(peakGain * 0.85,               t_end - rel);
+    gain.gain.exponentialRampToValueAtTime(0.001,           t_end);
+  }
+
+  // ── Pitch automation helpers — CHANGED osc2FreqOf only ───────────────────
+  // osc2 is now a chorus detune in BOTH modes, not an octave doubler in vocal mode.
+  // So osc2FreqOf always returns hz unchanged — the detune.value handles the spread.
+  const osc2FreqOf = (hz) => Math.max(20, hz);   // was: veenaMode ? hz : hz * 2
+
   const setF  = (hz, t) => {
-    osc1.frequency.setValueAtTime(Math.max(20, hz),     t);
-    osc2.frequency.setValueAtTime(Math.max(20, hz * 2), t);
+    osc1.frequency.setValueAtTime(Math.max(20, hz), t);
+    osc2.frequency.setValueAtTime(osc2FreqOf(hz),   t);
   };
   const rampF = (hz, t) => {
-    osc1.frequency.linearRampToValueAtTime(Math.max(20, hz),     t);
-    osc2.frequency.linearRampToValueAtTime(Math.max(20, hz * 2), t);
+    osc1.frequency.linearRampToValueAtTime(Math.max(20, hz), t);
+    osc2.frequency.linearRampToValueAtTime(osc2FreqOf(hz),   t);
   };
   const expF  = (hz, t) => {
-    osc1.frequency.exponentialRampToValueAtTime(Math.max(20, hz),     t);
-    osc2.frequency.exponentialRampToValueAtTime(Math.max(20, hz * 2), t);
+    osc1.frequency.exponentialRampToValueAtTime(Math.max(20, hz), t);
+    osc2.frequency.exponentialRampToValueAtTime(osc2FreqOf(hz),   t);
   };
 
-  // ── Legato seed: if the previous note ended at fromFreq, start there ──────
-  // This makes consecutive notes share pitch continuity instead of each
-  // attacking from silence, which is much closer to a vocal or bowed-string
-  // performance. When fromFreq is null we fall through to the per-gamakam
-  // default starting pitch (e.g. meend_in starts below).
-  const startF = fromFreq ?? freq;
+  const startF = veenaMode
+    ? (fromFreq ?? freq * 1.01)
+    : (fromFreq ?? freq);
 
-  // ── Per-gamakam pitch curve ───────────────────────────────────────────────
+  // ── Per-gamakam pitch curves — UNCHANGED ─────────────────────────────────
 
   if (gamakam === 'none' || !gamakam) {
-    // Plain note — anchor at freq (or slide from fromFreq if legato)
     if (fromFreq && Math.abs(fromFreq - freq) > 1) {
       setF(fromFreq, t0);
-      expF(freq, t0 + Math.min(0.06, dur * 0.15));  // quick settle
+      expF(freq, t0 + Math.min(0.06, dur * 0.15));
     } else {
       setF(freq, t0);
     }
 
   } else if (gamakam === 'kampita') {
-    // Asymmetric oscillation: 30% of each period up, 70% down.
-    // Matches GamakamEngine._kampita() exactly.
-    // depthCents=50, rateHz=5, delayMs=80 — same defaults as GamakamEngine.
     const delay  = 0.08;
-    const depth  = Math.pow(2, 50 / 1200);   // ratio, not additive Hz
-    const period = 1 / 5;                    // 5 Hz
+    const depth  = Math.pow(2, 50 / 1200);
+    const period = 1 / 5;
     const tStart = t0 + delay;
 
     setF(startF, t0);
-    // Settle to exact pitch before oscillation begins
     if (startF !== freq) expF(freq, tStart);
     else setF(freq, tStart);
 
     let tc = tStart;
     while (tc + period < t_end - 0.05) {
-      rampF(freq * depth,     tc + period * 0.30);   // 30% up
-      rampF(freq / depth,     tc + period * 0.70);   // 70% down
-      rampF(freq,             tc + period);           // return to base
+      rampF(freq * depth,     tc + period * 0.30);
+      rampF(freq / depth,     tc + period * 0.70);
+      rampF(freq,             tc + period);
       tc += period;
     }
-    // Always land cleanly on freq at note end
     rampF(freq, t_end - 0.03);
 
   } else if (gamakam === 'andola') {
-    // Wide slow oscillation — ±120c at ~2.5 Hz with 0ms delay.
-    // Characteristic of sustained G3 / N3 in Poorvikalyani.
-    // Matches GamakamEngine._andola() defaults.
     const depth  = Math.pow(2, 120 / 1200);
     const period = 1 / 2.5;
     const tStart = t0;
@@ -2938,33 +2964,25 @@ function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null) {
     rampF(freq, t_end - 0.03);
 
   } else if (gamakam === 'sphurita') {
-    // Quick mordent from ~100c above, landing on pitch in 65ms.
-    // Matches GamakamEngine._sphurita() defaults (aboveCents=100, durationMs=65).
     const upper = freq * Math.pow(2, 100 / 1200);
     setF(upper, t0);
     expF(freq,  t0 + 0.065);
-    // Anchor so there's no drift after mordent
     setF(freq,  t0 + 0.065);
 
   } else if (gamakam === 'nokku') {
-    // Grace note from +80c above, settles in 60ms.
     const above = freq * Math.pow(2, 80 / 1200);
     setF(above, t0);
     expF(freq,  t0 + 0.06);
     setF(freq,  t0 + 0.06);
 
   } else if (gamakam === 'meend_in') {
-    // Approach from 100c below, glide up to pitch over 130ms.
-    // Matches GamakamEngine._meendUp() fromOffsetCents=-100, durationMs=130.
     const below    = freq * Math.pow(2, -100 / 1200);
     const slideDur = 0.13;
     setF(below, t0);
     expF(freq,  t0 + slideDur);
-    setF(freq,  t0 + slideDur);   // anchor — prevents drift after slide
+    setF(freq,  t0 + slideDur);
 
   } else if (gamakam === 'meend_out') {
-    // Pitch holds then falls ~80c over last 110ms.
-    // Matches GamakamEngine._meendDown() toOffsetCents=-80, durationMs=110.
     const toFreq     = freq * Math.pow(2, -80 / 1200);
     const slideDur   = 0.11;
     const slideStart = t_end - slideDur;
@@ -2974,14 +2992,13 @@ function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null) {
     expF(toFreq, t_end);
 
   } else {
-    // Unknown gamakam — plain note, no crash
     setF(freq, t0);
   }
 
   osc1.start(t0); osc2.start(t0);
-  const stopT = t_end + 0.05;
+  const stopT = veenaMode ? t_end + 0.05 : t_end + 0.02;
   osc1.stop(stopT); osc2.stop(stopT);
-  osc2.onended = () => { try { gain.disconnect(); } catch (_) {} };
+  osc2.onended = () => { try { filter.disconnect(); gain.disconnect(); } catch (_) {} };
 }
 
 /* ── playGlide ──────────────────────────────────────────────────────────────
@@ -2998,20 +3015,28 @@ function playGlide(ctx, cents, srutiSaHz, durSec, t0) {
   if (!cents || cents.length < 2 || durSec <= 0) return;
 
   const gain = ctx.createGain();
+
+  // Same vocal-formant timbre as playNote for timbral consistency
+  const filter = ctx.createBiquadFilter();
+  filter.type            = 'bandpass';
+  filter.frequency.value = 900;
+  filter.Q.value         = 1.4;
+  filter.connect(gain);
   gain.connect(masterGain);
 
+  // Gain tail extends 100 ms past durSec — keeps pitch sweep audible through
+  // its full arc and overlaps the next note's attack for continuity.
   gain.gain.setValueAtTime(0.001, t0);
   gain.gain.linearRampToValueAtTime(0.65, t0 + Math.min(0.08, durSec * 0.15));
-  gain.gain.setValueAtTime(0.55, t0 + durSec * 0.75);
-  const CROSSFADE_G = 0.05;
-  gain.gain.linearRampToValueAtTime(0.001, t0 + durSec - CROSSFADE_G);
+  gain.gain.setValueAtTime(0.55,          t0 + durSec * 0.75);
+  gain.gain.linearRampToValueAtTime(0.001, t0 + durSec + 0.10);
 
-  const osc1 = ctx.createOscillator(); osc1.type = 'sawtooth';
-  const osc2 = ctx.createOscillator(); osc2.type = 'triangle';
-  const g1 = ctx.createGain(); g1.gain.value = 0.65;
-  const g2 = ctx.createGain(); g2.gain.value = 0.35;
-  osc1.connect(g1).connect(gain);
-  osc2.connect(g2).connect(gain);
+  const osc1 = ctx.createOscillator(); osc1.type = 'triangle';
+  const osc2 = ctx.createOscillator(); osc2.type = 'sawtooth';
+  const g1   = ctx.createGain(); g1.gain.value = 0.70;
+  const g2   = ctx.createGain(); g2.gain.value = 0.30;
+  osc1.connect(g1).connect(filter);
+  osc2.connect(g2).connect(filter);
 
   // Space control points evenly across durSec
   const step = durSec / (cents.length - 1);
@@ -3030,7 +3055,7 @@ function playGlide(ctx, cents, srutiSaHz, durSec, t0) {
   osc1.start(t0); osc2.start(t0);
   const stopT = t0 + durSec + 0.15;
   osc1.stop(stopT); osc2.stop(stopT);
-  osc2.onended = () => { try { gain.disconnect(); } catch (_) {} };
+  osc2.onended = () => { try { filter.disconnect(); gain.disconnect(); } catch (_) {} };
 }
 
 
@@ -3139,7 +3164,7 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
 
         // fromFreq seeds the oscillator at the previous note's landing pitch,
         // giving legato continuity. playNote() falls back gracefully when null.
-        playNote(ctx, freq, ev.noteDur, t, gamakam, prevFreq);
+        playNote(ctx, freq, ev.noteDur, t, gamakam, prevFreq, false); // harmonium timbre
         t += ev.noteDur + (ev.gap ?? 0);
 
         // meend_out leaves pitch below the nominal — next note seeds from tail.
@@ -3179,9 +3204,12 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
   //  Preserved as a fallback for ragams not yet migrated.
   //  Behaviour is identical to the original app.js for these ragams.
   // ══════════════════════════════════════════════════════════════════════════
-  const phrases = (efData.render_v2?.phrases?.length > 0)
-    ? efData.render_v2.phrases
-    : efData.phrases;
+  // ✅ FIX
+  const phrases = (efData.render_v2?.ordered_phrases?.length > 0)
+    ? efData.render_v2.ordered_phrases
+    : (efData.render_v2?.phrases?.length > 0)   // legacy v1 field name fallback
+      ? efData.render_v2.phrases
+      : efData.phrases;
  
   if (!phrases || phrases.length === 0) {
     dynamicInfo.innerHTML = '<i>No signature phrases stored for this ragam yet.</i>';
