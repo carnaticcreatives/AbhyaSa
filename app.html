@@ -92,13 +92,50 @@
     if (profile?.Sruthi) defaultSruti = profile.Sruthi;
 
     window.__appUser = {
-      id:          session.user.id,
-      email:       session.user.email,
-      name:        userName,
-      expiryDate:  sub.expiry_date,
+      id:           session.user.id,
+      email:        session.user.email,
+      name:         userName,
+      expiryDate:   sub.expiry_date,
       defaultSruti: defaultSruti,
-      supabase:    sb
+      supabase:     sb,
+      loginEventId: null,   // will be set after login event is logged
     };
+
+    // ── Log login event ────────────────────────────────────────────────────
+    // Detect country via ipapi.co (same service used by the pricing modal),
+    // then call the edge function to insert a login_events row.
+    // The returned row id is stored so logout can stamp the same record.
+    (async () => {
+      try {
+        let country = null;
+        try {
+          // ip-api.com works from localhost (HTTP only — fine for non-sensitive geo lookup)
+          const geo     = await fetch('http://ip-api.com/json/?fields=country,countryCode');
+          const geoData = await geo.json();
+          country = geoData.country ?? geoData.countryCode ?? null;
+        } catch (e) { /* geo lookup failure is non-fatal — country stays null */ }
+
+        const resp = await fetch(`${SUPABASE_URL}/functions/v1/log-login-event`, {
+          method:  'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({ action: 'login', country }),
+        });
+
+        if (resp.ok) {
+          const result = await resp.json();
+          if (result.login_event_id) {
+            window.__appUser.loginEventId = result.login_event_id;
+          }
+        } else {
+          console.warn('[LoginEvent] Edge function returned', resp.status);
+        }
+      } catch (e) {
+        console.warn('[LoginEvent] Could not log login event:', e);
+      }
+    })();
 
     // Populate menu fields before page becomes visible
     document.getElementById('bar-name').textContent    = userName;
@@ -808,9 +845,9 @@
     // Detect country via IP
     let isIndia = true;
     try {
-      const res = await fetch('https://ipapi.co/json/');
+      const res  = await fetch('http://ip-api.com/json/?fields=countryCode');
       const data = await res.json();
-      isIndia = data.country_code === 'IN';
+      isIndia = data.countryCode === 'IN';
     } catch (e) {
       isIndia = true;
     }
@@ -950,7 +987,28 @@
   // ── Logout ─────────────────────────────────────────────────────────────────
   async function doLogout() {
     const u = window.__appUser;
-    if (u?.supabase) await u.supabase.auth.signOut();
+    if (u?.supabase) {
+      // Stamp logged_out_at on the matching login_events row before signing out
+      try {
+        const session = (await u.supabase.auth.getSession()).data.session;
+        if (session) {
+          await fetch(`${SUPABASE_URL}/functions/v1/log-login-event`, {
+            method:  'POST',
+            headers: {
+              'Content-Type':  'application/json',
+              'Authorization': `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify({
+              action:         'logout',
+              login_event_id: u.loginEventId ?? undefined,
+            }),
+          });
+        }
+      } catch (e) {
+        console.warn('[LoginEvent] Could not log logout:', e);
+      }
+      await u.supabase.auth.signOut();
+    }
     window.location.href = 'index.html';
   }
 </script>
