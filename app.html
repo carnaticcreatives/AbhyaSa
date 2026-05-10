@@ -105,14 +105,16 @@
     // Detect country via ipapi.co (same service used by the pricing modal),
     // then call the edge function to insert a login_events row.
     // The returned row id is stored so logout can stamp the same record.
-    (async () => {
+    const isFreshLogin = sessionStorage.getItem('fresh_login') === '1';
+    sessionStorage.removeItem('fresh_login');
+
+    if (isFreshLogin) (async () => {
       try {
         let country = null;
         try {
-          // ip-api.com works from localhost (HTTP only — fine for non-sensitive geo lookup)
-          const geo     = await fetch('http://ip-api.com/json/?fields=country,countryCode');
+          const geo     = await fetch('https://ipapi.co/json/');
           const geoData = await geo.json();
-          country = geoData.country ?? geoData.countryCode ?? null;
+          country = geoData.country_name ?? geoData.country ?? null;
         } catch (e) { /* geo lookup failure is non-fatal — country stays null */ }
 
         const resp = await fetch(`${SUPABASE_URL}/functions/v1/log-login-event`, {
@@ -195,7 +197,22 @@
           .maybeSingle();
 
         if (!liveSub) {
-          // Subscription has expired or been revoked — log out and redirect
+          try {
+            const logoutSession = (await sb.auth.getSession()).data.session;
+            if (logoutSession) {
+              await fetch(`${SUPABASE_URL}/functions/v1/log-login-event`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${logoutSession.access_token}`,
+                },
+                body: JSON.stringify({
+                  action: 'logout',
+                  login_event_id: window.__appUser?.loginEventId ?? undefined,
+                }),
+              });
+            }
+          } catch(e) { /* non-fatal */ }
           await sb.auth.signOut();
           window.location.href = 'index.html?reason=expired';
         }
@@ -221,7 +238,23 @@
     let idleTimer;
 
     async function handleIdleTimeout() {
-      try { await sb.auth.signOut(); } catch(e) { /* ignore */ }
+      try {
+        const logoutSession = (await sb.auth.getSession()).data.session;
+        if (logoutSession) {
+          await fetch(`${SUPABASE_URL}/functions/v1/log-login-event`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${logoutSession.access_token}`,
+            },
+            body: JSON.stringify({
+              action: 'logout',
+              login_event_id: window.__appUser?.loginEventId ?? undefined,
+            }),
+          });
+        }
+      } catch(e) { /* non-fatal */ }
+      try { await sb.auth.signOut(); } catch(e) {}
       window.location.href = 'index.html?reason=idle';
     }
 

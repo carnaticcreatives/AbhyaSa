@@ -425,25 +425,7 @@ async function doLogin() {
     showMsg('msg-login', 'info', 'No active subscription found. Please contact carnaticcreatives@gmail.com to subscribe');
     return;
   }
-
-  // ── Log the login event (fire-and-forget — never blocks redirect) ─────
-  
-  try {
-    await fetch(
-      'https://wcpbbvurfbraqqqlpsro.supabase.co/functions/v1/log-login-even',
-      {
-        method:  'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': 'Bearer ' + data.session.access_token,
-        },
-      }
-    );
-  } catch (e) {
-    // Silently ignore — logging failure must never block login
-    console.warn('[login-event] Could not log login event:', e.message);
-  }
-
+  sessionStorage.setItem('fresh_login', '1');
   window.location.href = 'app.html';
 }
 
