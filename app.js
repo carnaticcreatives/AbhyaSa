@@ -40,16 +40,20 @@ async function loadAllRagamsFromSupabase() {
   const data = allData;
 
   // ── Build audava dict  { name: { aro, ava } } ──────────────────────────
+  // Normalise names (trim + collapse whitespace) before keying so that DB rows
+  // which differ only by invisible characters don't produce duplicate dropdown entries.
   const newAudava = {};
   data.filter(r => r.type === 'audava').forEach(r => {
-    newAudava[r.name] = { aro: r.arohanam, ava: r.avarohanam };
+    const key = r.name.trim().replace(/\s+/g, ' ');
+    newAudava[key] = { aro: r.arohanam, ava: r.avarohanam };
   });
   _audava_ragam_dict_live = newAudava;
 
   // ── Build shadava dict  { name: { aro, ava } } ─────────────────────────
   const newShadava = {};
   data.filter(r => r.type === 'shadava').forEach(r => {
-    newShadava[r.name] = { aro: r.arohanam, ava: r.avarohanam };
+    const key = r.name.trim().replace(/\s+/g, ' ');
+    newShadava[key] = { aro: r.arohanam, ava: r.avarohanam };
   });
   _shadava_ragam_dict_live = newShadava;
 
@@ -139,8 +143,12 @@ document.querySelectorAll("input[name=ragaType]").forEach(r => {
       ragamSelect.style.display = "";
     }
 
-    // For audava/shadava: wait for bulk Supabase load to finish first
-    if ((r.value === "audava" || r.value === "shadava") && ragamInitPromise) {
+    // For audava/shadava: always wait for the Supabase load before populating
+    // the dropdown, even if ragamInitPromise hasn't been set yet (user clicked
+    // the tab before ragamInit() fired). If ragamInitPromise is null we start
+    // ragamInit() ourselves so there is a promise to await.
+    if (r.value === "audava" || r.value === "shadava") {
+      if (!ragamInitPromise) ragamInit(); // kick off if not already started
       await ragamInitPromise;
     }
 
@@ -197,26 +205,47 @@ const VARISAI_ALL_WITH_TISRAM = [
 })();
 
 /** Called from app.html session guard after __appUser is confirmed.
- *  Loads audava, shadava and janya ragams from Supabase.
- *  If the user is currently viewing audava/shadava/janya, refreshes the dropdown. */
+ *  Loads audava, shadava and sampoorna ragams from Supabase, then populates
+ *  whichever tab is currently active.
+ *
+ *  ROOT CAUSE OF DUPLICATE: The old code ran the per-tab branch first
+ *  (e.g. loadAudavaRagams()), then called loadSampoornaRagams() unconditionally
+ *  at the end. That unconditional call wiped ragamSelect and refilled it with
+ *  sampoorna ragams. The onchange handler — which was ALSO awaiting
+ *  ragamInitPromise — then called loadAudavaRagams() again to fix the display,
+ *  resulting in two successive populations of the audava list and therefore
+ *  two copies of every ragam including Suddha Saveri.
+ *
+ *  FIX: call loadSampoornaRagams() FIRST (so melakarta_dict is in the DOM for
+ *  later tab switching), then overwrite ragamSelect with the correct active-tab
+ *  content. No unconditional second call at the end. Guard against re-entry. */
 async function ragamInit() {
+  if (ragamInitPromise) {
+    // Already running or completed — reuse the existing promise, don't re-fetch
+    await ragamInitPromise;
+    return;
+  }
+
   ragamInitPromise = loadAllRagamsFromSupabase();
   try {
     await ragamInitPromise;
 
-    // Refresh whichever tab is currently active
+    // Step 1: always fill sampoorna first so the sampoorna tab is ready
+    // for switching, and so melakarta_dict is populated into the DOM.
+    loadSampoornaRagams();
+
+    // Step 2: if the user is on a different tab, overwrite ragamSelect now.
+    // This MUST come after step 1 — if it came before, loadSampoornaRagams()
+    // would wipe the audava/shadava fill and trigger the duplicate bug.
     const currentType = document.querySelector("input[name=ragaType]:checked")?.value;
-    if (currentType === "sampoorna" || !currentType) {
-      loadSampoornaRagams();  // melakarta_dict now populated from Supabase
-    } else if (currentType === "audava") {
+    if (currentType === "audava") {
       loadAudavaRagams();
     } else if (currentType === "shadava") {
       loadShadavaRagams();
     } else if (currentType === "janya") {
-      loadJanyaSearchUI();  // janya is on-demand — just show the search UI
+      loadJanyaSearchUI();
     }
-    // Always rebuild sampoorna in background for tab switching
-    loadSampoornaRagams();
+    // sampoorna / tambura / null: step 1 already set ragamSelect correctly.
 
   } catch(e) {
     console.error('[RagamInit] Failed to load ragams from Supabase:', e.message);
@@ -229,6 +258,7 @@ async function ragamInit() {
  ***********************/
 let audioCtx = null;
 let masterGain = null;
+let tanpuraGainNode = null;   // Dedicated gain node — clamps tanpura to background level
 let tanpuraBuffer = null;
 let tanpuraSource = null;
 let isPlaying = false;
@@ -257,15 +287,65 @@ let playedNotes = 0;
 
 
 
+// ── Vocal Formant Dictionary ────────────────────────────────────────────────
+// Each vowel defines 3 formant frequencies (Hz), Q values, and relative gains.
+// The gain array correctly weights the three peaks — F1 loudest, F3 quietest.
+//   'Aa' — open mouth, main Carnatic akaram vowel
+//   'Ee' — bright, front vowel — upper register phrases
+//   'Oo' — dark, rounded — lower register (mandraa sthayi)
+const VOWEL_MAP = {
+  'Aa': { f: [730, 1090, 2440], q: [7,  8,  10], g: [1.0, 0.60, 0.35] },
+  'Ee': { f: [270, 2290, 3010], q: [10, 12, 12], g: [1.0, 0.40, 0.25] },
+  'Oo': { f: [300,  870, 2240], q: [8,  10, 10], g: [1.0, 0.50, 0.18] }
+};
+
+// ── S-Curve legato in log-Hz space ──────────────────────────────────────────
+// Interpolates fromHz→toHz using 3t²-2t³ smoothstep, working in CENTS (log
+// domain) so the acceleration feels symmetric to the ear. A straight Hz ramp
+// sounds faster going down; a cents-domain curve is perceptually even.
+function getSCurveHz(fromHz, toHz, srutiSaHz, len) {
+  len = len || 128;
+  const curve    = new Float32Array(len);
+  const fromCent = 1200 * Math.log2(Math.max(20, fromHz) / srutiSaHz);
+  const toCent   = 1200 * Math.log2(Math.max(20, toHz)   / srutiSaHz);
+  for (let i = 0; i < len; i++) {
+    const t   = i / (len - 1);
+    const sqt = t * t * (3 - 2 * t);
+    curve[i]  = Math.max(20, srutiSaHz * Math.pow(2, (fromCent + (toCent - fromCent) * sqt) / 1200));
+  }
+  return curve;
+}
+
+// ── Vocal "Grit" WaveShaper — cached singleton ──────────────────────────────
+// tanh(x*1.1)/tanh(1.1) is a very soft saturation — adds ~10% THD which
+// the ear perceives as "organic" texture rather than audible distortion.
+let _vocalGritCurve = null;
+function getVocalGritCurve() {
+  if (_vocalGritCurve) return _vocalGritCurve;
+  const n = 4096, norm = Math.tanh(1.1);
+  const c = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const x = (i / n) * 2 - 1; c[i] = Math.tanh(x * 1.1) / norm; }
+  _vocalGritCurve = c;
+  return c;
+}
+
 /***********************
  * AUDIO CONTEXT
  ***********************/
 function getAudioCtx() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // Master output node — carries melody, varisai, and raga lakshana
     masterGain = audioCtx.createGain();
     masterGain.gain.value = 0.9;
     masterGain.connect(audioCtx.destination);
+
+    // Dedicated tanpura gain — clamped to 14% so the drone stays in the background
+    // and never overpowers the melodic content routed through masterGain
+    tanpuraGainNode = audioCtx.createGain();
+    tanpuraGainNode.gain.value = 0.14;
+    tanpuraGainNode.connect(audioCtx.destination);
   }
 
   if (audioCtx.state === "suspended") {
@@ -299,10 +379,11 @@ async function startTanpura(srutiFactor = 1.0) {
 
   tanpuraSource.playbackRate.value = srutiFactor;
 
-  const g = ctx.createGain();
-  g.gain.value = 0.35;  // raised from 0.06 — tanpura audible for sruti alignment
-
-  tanpuraSource.connect(g).connect(masterGain);
+  // ACOUSTIC BALANCE FIX: Route tanpura through the dedicated tanpuraGainNode
+  // (clamped to 0.14 in getAudioCtx) rather than through masterGain.
+  // This keeps the drone at ~14% while melodic content on masterGain stays dominant.
+  tanpuraGainNode.gain.setValueAtTime(0.14, ctx.currentTime);
+  tanpuraSource.connect(tanpuraGainNode);
   tanpuraSource.start();
 }
 
@@ -471,43 +552,82 @@ function playPiano(freq, dur, startTime, ctx) {
   const gain = ctx.createGain();
   gain.connect(masterGain);
 
-  /* SMOOTH ENVELOPE */
-  gain.gain.setValueAtTime(0.001, startTime);
-  gain.gain.linearRampToValueAtTime(0.7, startTime + 0.12);
-  gain.gain.setValueAtTime(0.6, startTime + dur * 0.7);
-  gain.gain.linearRampToValueAtTime(0.001, startTime + dur + 0.15);
+  // ── Vocal "Aa" formant engine — matches playNote() vocal path ────────────
+  // Replaces the old harmonium (sawtooth + octave triangle, no filter).
+  // Now: sawtooth (buzz) + triangle (body) → 3 parallel bandpass formants
+  // + breath drift LFO for natural pitch instability.
 
-  /* HARMONIUM-LIKE OSCILLATORS */
+  // 1. Breath drift LFO (+/-9 cents at ~3.5 Hz)
+  const driftLfo  = ctx.createOscillator();
+  const driftGain = ctx.createGain();
+  driftLfo.type            = 'sine';
+  driftLfo.frequency.value = 3.5 + (Math.random() - 0.5) * 0.8;
+  driftGain.gain.value     = 9;
+  driftLfo.connect(driftGain);
+
+  // 2. Oscillators — buzz + body blend
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
-
-  osc1.type = "sawtooth";
-  osc2.type = "triangle";
-
+  osc1.type = 'sawtooth'; // vocal cord buzz
+  osc2.type = 'triangle'; // chest resonance
   osc1.frequency.value = freq;
-  osc2.frequency.value = freq * 2;
+  osc2.frequency.value = freq;
+  driftGain.connect(osc1.detune);
+  driftGain.connect(osc2.detune);
 
-  const g1 = ctx.createGain(); g1.gain.value = 0.65;
-  const g2 = ctx.createGain(); g2.gain.value = 0.35;
+  const g1 = ctx.createGain(); g1.gain.value = 0.48;
+  const g2 = ctx.createGain(); g2.gain.value = 0.52;
+  osc1.connect(g1);
+  osc2.connect(g2);
 
-  osc1.connect(g1).connect(gain);
-  osc2.connect(g2).connect(gain);
+  // 3. Register-aware vowel + formant filter bank with per-filter gain weighting
+  const vowelKey = freq > 523 ? 'Ee' : (freq < 131 ? 'Oo' : 'Aa');
+  const vDef     = VOWEL_MAP[vowelKey];
+  const atkEnd   = startTime + 0.03;
 
+  const f1 = ctx.createBiquadFilter(); f1.type = 'bandpass'; f1.Q.value = vDef.q[0];
+  const f2 = ctx.createBiquadFilter(); f2.type = 'bandpass'; f2.Q.value = vDef.q[1];
+  const f3 = ctx.createBiquadFilter(); f3.type = 'bandpass'; f3.Q.value = vDef.q[2];
+  f1.frequency.setValueAtTime(vDef.f[0] * 1.12, startTime); f1.frequency.exponentialRampToValueAtTime(vDef.f[0], atkEnd);
+  f2.frequency.setValueAtTime(vDef.f[1] * 1.18, startTime); f2.frequency.exponentialRampToValueAtTime(vDef.f[1], atkEnd);
+  f3.frequency.setValueAtTime(vDef.f[2] * 1.14, startTime); f3.frequency.exponentialRampToValueAtTime(vDef.f[2], atkEnd);
+
+  const fgArr = [f1, f2, f3].map((f, i) => {
+    const fg = ctx.createGain(); fg.gain.value = vDef.g[i];
+    g1.connect(f); g2.connect(f); f.connect(fg);
+    return fg;
+  });
+
+  const fMix = ctx.createGain(); fMix.gain.value = 0.88;
+  fgArr.forEach(fg => fg.connect(fMix));
+
+  // Vocal grit (tanh soft-clip) — subtle organic saturation
+  const grit = ctx.createWaveShaper();
+  grit.curve      = getVocalGritCurve();
+  grit.oversample = '2x';
+  fMix.connect(grit);
+  grit.connect(gain);
+
+  // 4. Smooth vocal envelope — peak at 0.82 so melody cuts clearly over the tanpura drone
+  const atk = Math.min(0.04, Math.max(0.012, dur * 0.06));
+  gain.gain.setValueAtTime(0.001, startTime);
+  gain.gain.exponentialRampToValueAtTime(0.82,  startTime + atk);
+  gain.gain.setValueAtTime(0.72, startTime + dur * 0.75);
+  gain.gain.exponentialRampToValueAtTime(0.001, startTime + dur + 0.08);
+
+  driftLfo.start(startTime);
   osc1.start(startTime);
   osc2.start(startTime);
 
   const stopTime = startTime + dur + 0.2;
+  driftLfo.stop(stopTime);
   osc1.stop(stopTime);
   osc2.stop(stopTime);
 
-  // CRITICAL: disconnect gain from masterGain as soon as oscillators finish.
-  // Without this, when a skip zeroes masterGain and the next pattern immediately
-  // restores it to 0.9, any still-running oscillators from the previous pattern
-  // (which haven't hit their .stop() time yet) are suddenly re-amplified through
-  // masterGain and become audible again — causing the overlap.
-  // onended fires when the last oscillator in this note's graph stops.
   osc2.onended = () => {
-    try { gain.disconnect(); } catch (_) {}
+    try { f1.disconnect(); f2.disconnect(); f3.disconnect();
+          fgArr.forEach(fg => fg.disconnect());
+          fMix.disconnect(); grit.disconnect(); gain.disconnect(); } catch (_) {}
   };
 }
 
@@ -1992,6 +2112,7 @@ function hardStopAllAudio() {
 
   audioCtx = null;
   masterGain = null;
+  tanpuraGainNode = null;
   tanpuraSource = null;
 
   // do NOT reset tanpuraBuffer — keep it cached for next play
@@ -2322,51 +2443,80 @@ class GamakamEngine {
     if (!freq || durSec <= 0) return;
     const ctx = this.ctx;
 
-    // ── Harmonium timbre — identical to playNote() ────────────────────────
-    // Was: sawtooth + triangle, osc2 at freq*2 (octave-double), no filter.
-    // Now: sawtooth + sawtooth 7¢ detune, lowpass 2200 Hz — same as playNote.
+    // ── Vocal timbre — matches the upgraded playNote() vocal path ────────────
+    // sawtooth (buzz) + triangle (body) → parallel "Aa" formant filters → gain
     // This makes aro/ava (legacy PATH B) sound identical to phrase playback.
-    const filter = ctx.createBiquadFilter();
-    filter.type            = 'lowpass';
-    filter.frequency.value = 2200;
-    filter.Q.value         = 0.8;
+    const t0    = startTime;
+    const t_end = t0 + durSec;
 
     const g = ctx.createGain();
-    filter.connect(g);
     g.connect(this.masterGain);
 
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
     osc1.type = 'sawtooth';
-    osc2.type = 'sawtooth';
-    osc2.detune.value = 7;   // 7¢ chorus warmth — not an octave doubler
+    osc2.type = 'triangle';
+    osc2.detune.value = 0;  // breath LFO handles spread
 
-    osc1.frequency.value = freq;
-    osc2.frequency.value = freq;   // same pitch, detune handles spread
+    const g1 = ctx.createGain(); g1.gain.value = 0.48;
+    const g2 = ctx.createGain(); g2.gain.value = 0.52;
+    osc1.connect(g1); osc2.connect(g2);
 
-    const g1 = ctx.createGain(); g1.gain.value = 0.60;
-    const g2 = ctx.createGain(); g2.gain.value = 0.40;
-    osc1.connect(g1).connect(filter);
-    osc2.connect(g2).connect(filter);
+    // Breath drift LFO
+    const driftLfo  = ctx.createOscillator();
+    const driftGain = ctx.createGain();
+    driftLfo.type            = 'sine';
+    driftLfo.frequency.value = 3.5 + (Math.random() - 0.5) * 0.8;
+    driftGain.gain.value     = 9;
+    driftLfo.connect(driftGain);
+    driftGain.connect(osc1.detune);
+    driftGain.connect(osc2.detune);
+    driftLfo.start(t0);
+    driftLfo.stop(t_end + 0.05);
 
-    const t0  = startTime;
-    const t_end = t0 + durSec;
-    const peakGain = (profile?.type === 'kampita' || profile?.type === 'andola') ? 0.58 : 0.55;
-    const atk      = Math.min(0.025, Math.max(0.008, durSec * 0.06));
-    const rel      = 0.015;
+    // Register-aware vowel selection + per-filter gain weighting
+    const vowelKey = freq > 523 ? 'Ee' : (freq < 131 ? 'Oo' : 'Aa');
+    const vDef     = VOWEL_MAP[vowelKey];
 
-    g.gain.setValueAtTime(0.001,           t0);
-    g.gain.exponentialRampToValueAtTime(peakGain,        t0 + atk);
-    g.gain.setValueAtTime(peakGain * 0.85,               t_end - rel);
-    g.gain.exponentialRampToValueAtTime(0.001,           t_end);
+    const f1 = ctx.createBiquadFilter(); f1.type = 'bandpass'; f1.Q.value = vDef.q[0];
+    const f2 = ctx.createBiquadFilter(); f2.type = 'bandpass'; f2.Q.value = vDef.q[1];
+    const f3 = ctx.createBiquadFilter(); f3.type = 'bandpass'; f3.Q.value = vDef.q[2];
+
+    const atkMs = 0.03;
+    f1.frequency.setValueAtTime(vDef.f[0] * 1.12, t0); f1.frequency.exponentialRampToValueAtTime(vDef.f[0], t0 + atkMs);
+    f2.frequency.setValueAtTime(vDef.f[1] * 1.18, t0); f2.frequency.exponentialRampToValueAtTime(vDef.f[1], t0 + atkMs);
+    f3.frequency.setValueAtTime(vDef.f[2] * 1.14, t0); f3.frequency.exponentialRampToValueAtTime(vDef.f[2], t0 + atkMs);
+
+    const fgArr = [f1, f2, f3].map((f, i) => {
+      const fg = ctx.createGain(); fg.gain.value = vDef.g[i];
+      g1.connect(f); g2.connect(f); f.connect(fg);
+      return fg;
+    });
+
+    const fMix = ctx.createGain(); fMix.gain.value = 0.88;
+    fgArr.forEach(fg => fg.connect(fMix));
+
+    const grit = ctx.createWaveShaper();
+    grit.curve      = getVocalGritCurve();
+    grit.oversample = '2x';
+    fMix.connect(grit);
+    grit.connect(g);
+
+    // ACOUSTIC BALANCE: Melody peak is raised to 0.75/0.72 so raga aro/ava and
+    // signature phrase notes remain clearly dominant over the 14% tanpura drone.
+    const peakGain    = (profile?.type === 'kampita' || profile?.type === 'andola') ? 0.75 : 0.72;
+    const atk         = Math.min(0.025, Math.max(0.010, durSec * 0.06));
+    const releaseFloor = durSec >= 0.45 ? 0.001 : 0.18;
+    const rel          = 0.018;
+
+    g.gain.setValueAtTime(0.001, t0);
+    g.gain.exponentialRampToValueAtTime(peakGain,       t0 + atk);
+    g.gain.setValueAtTime(peakGain * 0.88,              t_end - rel);
+    g.gain.exponentialRampToValueAtTime(releaseFloor,   t_end);
 
     if (profile && profile.type !== "none") {
-      // _applyToOsc still works correctly: it operates on osc1/osc2 frequency
-      // params directly, and osc2 is now a same-pitch chorus partner so the
-      // gamakam pitch curves (kampita, meend, andola) apply to both correctly.
       this._applyToOsc(osc1, osc2, freq, t0, durSec, profile);
     } else {
-      // Plain note — set both oscillators to freq explicitly
       osc1.frequency.setValueAtTime(freq, t0);
       osc2.frequency.setValueAtTime(freq, t0);
     }
@@ -2374,7 +2524,11 @@ class GamakamEngine {
     osc1.start(t0); osc2.start(t0);
     const stopT = t_end + 0.02;
     osc1.stop(stopT); osc2.stop(stopT);
-    osc2.onended = () => { try { filter.disconnect(); g.disconnect(); } catch (_) {} };
+    osc2.onended = () => {
+      try { f1.disconnect(); f2.disconnect(); f3.disconnect();
+            fgArr.forEach(fg => fg.disconnect());
+            fMix.disconnect(); grit.disconnect(); g.disconnect(); } catch (_) {}
+    };
   }
 
   // ── scheduleCurve ────────────────────────────────────────────────────────
@@ -2415,69 +2569,105 @@ class GamakamEngine {
       return { tSec: tJit, f: cJit };
     });
 
-    // ── Single oscillator pair (sawtooth + triangle = harmonium-like) ──
-    const g  = ctx.createGain();
+    // ── Vocal formant engine — identical to playNote/playGlide ───────────
+    // Previously: sawtooth+triangle directly to gain, osc2 octave-doubled,
+    // linear gain ramps, exponential pitch ramps between control points.
+    // Now: formant bank + grit + breath drift + S-curve pitch segments.
+    const t0    = startTime;
+    const t_end = t0 + totalDurSec;
+
+    const g = ctx.createGain();
     g.connect(this.masterGain);
 
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
     osc1.type = 'sawtooth'; osc2.type = 'triangle';
 
-    const g1 = ctx.createGain(); g1.gain.value = 0.65;
-    const g2 = ctx.createGain(); g2.gain.value = 0.35;
-    osc1.connect(g1).connect(g);
-    osc2.connect(g2).connect(g);
+    const g1 = ctx.createGain(); g1.gain.value = 0.48;
+    const g2 = ctx.createGain(); g2.gain.value = 0.52;
+    osc1.connect(g1); osc2.connect(g2);
 
-    // ── Phrase-level gain envelope ─────────────────────────────────────
-    // Attack over first 8% of phrase (min 30ms, max 120ms) — smooth entry.
-    // Sustain at 0.68 for body of phrase.
-    // Release over last 12% (min 50ms) — smooth exit into next phrase.
-    const t0    = startTime;
-    const t_end = t0 + totalDurSec;
-    const atk   = Math.min(0.12, Math.max(0.03, totalDurSec * 0.08));
-    const rel   = Math.min(0.18, Math.max(0.05, totalDurSec * 0.12));
+    // Breath drift LFO — same as playNote
+    const driftLfo  = ctx.createOscillator();
+    const driftGain = ctx.createGain();
+    driftLfo.type = 'sine'; driftLfo.frequency.value = 3.5 + (Math.random() - 0.5) * 0.8;
+    driftGain.gain.value = 9;
+    driftLfo.connect(driftGain);
+    driftGain.connect(osc1.detune); driftGain.connect(osc2.detune);
+    driftLfo.start(t0); driftLfo.stop(t_end + 0.1);
+
+    // Register-aware vowel from the MIDPOINT of the phrase
+    const midPt   = pts[Math.floor(pts.length / 2)];
+    const midFreq = midPt ? midPt.f : (pts[0] ? pts[0].f : 220);
+    const vowelKey = midFreq > 523 ? 'Ee' : (midFreq < 131 ? 'Oo' : 'Aa');
+    const vDef     = VOWEL_MAP[vowelKey];
+
+    const f1 = ctx.createBiquadFilter(); f1.type = 'bandpass'; f1.Q.value = vDef.q[0]; f1.frequency.value = vDef.f[0];
+    const f2 = ctx.createBiquadFilter(); f2.type = 'bandpass'; f2.Q.value = vDef.q[1]; f2.frequency.value = vDef.f[1];
+    const f3 = ctx.createBiquadFilter(); f3.type = 'bandpass'; f3.Q.value = vDef.q[2]; f3.frequency.value = vDef.f[2];
+
+    const fgArr = [f1, f2, f3].map((f, i) => {
+      const fg = ctx.createGain(); fg.gain.value = vDef.g[i];
+      g1.connect(f); g2.connect(f); f.connect(fg);
+      return fg;
+    });
+    const fMix = ctx.createGain(); fMix.gain.value = 0.88;
+    fgArr.forEach(fg => fg.connect(fMix));
+
+    const grit = ctx.createWaveShaper();
+    grit.curve = getVocalGritCurve(); grit.oversample = '2x';
+    fMix.connect(grit); grit.connect(g);
+
+    // ── Phrase-level gain envelope — exponential (smoother than linear) ──
+    const atk = Math.min(0.12, Math.max(0.03, totalDurSec * 0.08));
+    const rel = Math.min(0.18, Math.max(0.05, totalDurSec * 0.12));
 
     g.gain.setValueAtTime(0.001, t0);
-    g.gain.linearRampToValueAtTime(0.68, t0 + atk);
+    g.gain.exponentialRampToValueAtTime(0.68, t0 + atk);
     g.gain.setValueAtTime(0.68, t_end - rel);
-    g.gain.linearRampToValueAtTime(0.001, t_end + 0.06);
+    g.gain.exponentialRampToValueAtTime(0.001, t_end + 0.06);
 
-    // ── Pitch curve automation ─────────────────────────────────────────
-    // First point: setValueAtTime (anchor — no ramp from undefined)
-    osc1.frequency.setValueAtTime(pts[0].f,     t0 + pts[0].tSec);
-    osc2.frequency.setValueAtTime(pts[0].f * 2, t0 + pts[0].tSec);
+    // ── S-curve pitch automation between control points ───────────────────
+    // Each segment uses getSCurveHz (3t²−2t³ in log-Hz space) instead of a
+    // raw exponentialRamp — gives the slow-fast-slow vocal glide character.
+    // hold points get a straight setValueAtTime anchor (no ramp needed).
+    osc1.frequency.setValueAtTime(Math.max(20, pts[0].f), t0 + pts[0].tSec);
+    osc2.frequency.setValueAtTime(Math.max(20, pts[0].f), t0 + pts[0].tSec);
 
     for (let i = 1; i < pts.length; i++) {
+      const prev = pts[i - 1];
       const curr = pts[i];
       const tAbs = t0 + curr.tSec;
+      const segDur = Math.max(0.001, curr.tSec - prev.tSec);
 
       if (curr.hold) {
-        // 🎯 LAND + STAY
-        osc1.frequency.setValueAtTime(curr.f, tAbs);
-        osc2.frequency.setValueAtTime(curr.f * 2, tAbs);
-
-        // extend hold slightly
-        const holdDur = 0.15; // seconds (tune later)
-        osc1.frequency.setValueAtTime(curr.f, tAbs + holdDur);
-        osc2.frequency.setValueAtTime(curr.f * 2, tAbs + holdDur);
-
+        osc1.frequency.setValueAtTime(Math.max(20, curr.f), tAbs);
+        osc2.frequency.setValueAtTime(Math.max(20, curr.f), tAbs);
+        // Sustain hold
+        osc1.frequency.setValueAtTime(Math.max(20, curr.f), tAbs + 0.15);
+        osc2.frequency.setValueAtTime(Math.max(20, curr.f), tAbs + 0.15);
       } else {
-        // 🎯 MOVE
-        osc1.frequency.exponentialRampToValueAtTime(curr.f, tAbs);
-        osc2.frequency.exponentialRampToValueAtTime(curr.f * 2, tAbs);
+        // S-curve glide — srutiSaHz approximated from first point frequency
+        const refHz = pts[0].f;
+        const scCurve = getSCurveHz(prev.f, curr.f, refHz, 96);
+        osc1.frequency.setValueCurveAtTime(scCurve, t0 + prev.tSec, segDur);
+        osc2.frequency.setValueCurveAtTime(scCurve, t0 + prev.tSec, segDur);
       }
     }
 
-    // Always anchor to last point's exact freq at t_end — prevents drift
-    // if the curve's last timestamp is slightly before totalDurSec
-    const lastF = pts[pts.length - 1].f;
-    osc1.frequency.setValueAtTime(lastF,     t_end);
-    osc2.frequency.setValueAtTime(lastF * 2, t_end);
+    // Anchor to last point at t_end to prevent drift
+    const lastF = Math.max(20, pts[pts.length - 1].f);
+    osc1.frequency.setValueAtTime(lastF, t_end);
+    osc2.frequency.setValueAtTime(lastF, t_end);
 
     osc1.start(t0); osc2.start(t0);
     const stopT = t_end + 0.10;
     osc1.stop(stopT); osc2.stop(stopT);
-    osc2.onended = () => { try { g.disconnect(); } catch (_) {} };
+    osc2.onended = () => {
+      try { f1.disconnect(); f2.disconnect(); f3.disconnect();
+            fgArr.forEach(fg => fg.disconnect());
+            fMix.disconnect(); grit.disconnect(); g.disconnect(); } catch (_) {}
+    };
   }
 
   _applyToOsc(osc1, osc2, freq, t0, durSec, profile) {
@@ -2496,26 +2686,41 @@ class GamakamEngine {
   //    frequency automation here controls the fundamental pitch only.
 
   _kampita(osc1, osc2, base, t0, dur, p) {
-    const delay  = (p.delayMs ?? 80) / 1000;
-    const depth  = _centsToRatio(p.depthCents ?? 50);
-    const period = 1 / (p.rateHz ?? 5);
-    const tStart = t0 + delay, tEnd = t0 + dur;
+    // FIX: default delay reduced from 80ms → 30ms so the oscillation is heard
+    // immediately on short notes (the signature jiva swara kampita in Abhogi
+    // on g2/m1 is 350ms; 80ms settle left only 1.35 cycles at 5Hz — inaudible)
+    const delay   = (p.delayMs   ?? 30) / 1000;
+    const rateHz  = p.rateHz     ?? 5;
+    const depthHz = base * _centsToRatio(p.depthCents ?? 50) - base; // Hz swing above base
+    const tStart  = t0 + delay;
+    const tEnd    = t0 + dur;
 
+    // Anchor at base during the settle window
     osc1.frequency.setValueAtTime(base, t0);
     osc2.frequency.setValueAtTime(base, t0);
 
-    let t = tStart;
-    while (t + period < tEnd) {
-      osc1.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
-      osc1.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
-      osc1.frequency.linearRampToValueAtTime(base,         t + period);
-      osc2.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
-      osc2.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
-      osc2.frequency.linearRampToValueAtTime(base,         t + period);
-      t += period;
+    // Build a high-resolution sine curve — 120 control points per second
+    // gives smooth oscillation with no audible corners at the peaks/troughs
+    const curveDur = Math.max(0, tEnd - tStart);
+    if (curveDur <= 0) return;
+
+    const sampleRate = 120;
+    const curveLen   = Math.max(2, Math.ceil(curveDur * sampleRate));
+    const curve      = new Float32Array(curveLen);
+
+    for (let i = 0; i < curveLen; i++) {
+      const phase = (i / sampleRate) * rateHz * 2 * Math.PI;
+      // FIX: taper in over 20ms (was 40ms) — matches how singers attack jiva swaras
+      const taper = Math.min(1, i / (sampleRate * 0.02));
+      curve[i] = Math.max(20, base + depthHz * Math.sin(phase) * taper);
     }
-    osc1.frequency.linearRampToValueAtTime(base, tEnd);
-    osc2.frequency.linearRampToValueAtTime(base, tEnd);
+
+    osc1.frequency.setValueCurveAtTime(curve, tStart, curveDur);
+    osc2.frequency.setValueCurveAtTime(curve, tStart, curveDur);
+
+    // Land cleanly on base after the kampita window
+    osc1.frequency.setValueAtTime(base, tEnd);
+    osc2.frequency.setValueAtTime(base, tEnd);
   }
 
   _meendUp(osc1, osc2, base, t0, p) {
@@ -2551,26 +2756,34 @@ class GamakamEngine {
   }
 
   _andola(osc1, osc2, base, t0, dur, p) {
-    const delay  = (p.delayMs ?? 0) / 1000;
-    const depth  = _centsToRatio(p.depthCents ?? 120);
-    const period = 1 / (p.rateHz ?? 2.5);
-    const tStart = t0 + delay, tEnd = t0 + dur;
+    const delay   = (p.delayMs   ?? 0) / 1000;
+    const rateHz  = p.rateHz     ?? 2.5;
+    const depthHz = base * _centsToRatio(p.depthCents ?? 120) - base;
+    const tStart  = t0 + delay;
+    const tEnd    = t0 + dur;
 
     osc1.frequency.setValueAtTime(base, t0);
     osc2.frequency.setValueAtTime(base, t0);
 
-    let t = tStart;
-    while (t + period < tEnd) {
-      osc1.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
-      osc1.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
-      osc1.frequency.linearRampToValueAtTime(base,         t + period);
-      osc2.frequency.linearRampToValueAtTime(base * depth, t + period * 0.30);
-      osc2.frequency.linearRampToValueAtTime(base / depth, t + period * 0.70);
-      osc2.frequency.linearRampToValueAtTime(base,         t + period);
-      t += period;
+    const curveDur = Math.max(0, tEnd - tStart);
+    if (curveDur <= 0) return;
+
+    // Andola (wide, slow sway) — same sine approach, but depth tapers in over 80ms
+    const sampleRate = 120;
+    const curveLen   = Math.max(2, Math.ceil(curveDur * sampleRate));
+    const curve      = new Float32Array(curveLen);
+
+    for (let i = 0; i < curveLen; i++) {
+      const phase = (i / sampleRate) * rateHz * 2 * Math.PI;
+      const taper = Math.min(1, i / (sampleRate * 0.08)); // 80ms taper-in
+      curve[i] = Math.max(20, base + depthHz * Math.sin(phase) * taper);
     }
-    osc1.frequency.linearRampToValueAtTime(base, tEnd);
-    osc2.frequency.linearRampToValueAtTime(base, tEnd);
+
+    osc1.frequency.setValueCurveAtTime(curve, tStart, curveDur);
+    osc2.frequency.setValueCurveAtTime(curve, tStart, curveDur);
+
+    osc1.frequency.setValueAtTime(base, tEnd);
+    osc2.frequency.setValueAtTime(base, tEnd);
   }
 }
 
@@ -2734,18 +2947,26 @@ const SWARA_CENTS = {
 /* ── parsePhrase ────────────────────────────────────────────────────────────
  *  Turns a notation string into an ordered array of note events.
  *  Each event: { cents, noteDur, gap, gamakam }
- *  noteDur and gap are in MATRAS (caller multiplies by MATRA seconds).
+ *  noteDur is in seconds; gap is the inter-note breath in seconds.
+ *
+ *  FIX: The original used gap = matra (0.35s) after every note, making
+ *  phrases sound choppy — each note was half note, half silence. Real
+ *  Carnatic singing is legato; inter-note silence is 20ms (a glottal breath),
+ *  not a full matra. Phrase-boundary gaps are added by the caller (GAP_SEC).
+ *
+ *  New gap policy:
+ *    plain note      → 20ms inter-note breath
+ *    sustained note  → 40ms after the sustained portion (already long enough)
+ *    group ( )       → 0ms within, 20ms after last note
+ *    fast group { }  → 0ms within, 20ms after last note
+ *    glide group | | → 20ms after
  */
 function parsePhrase(notation, matra) {
   const events = [];
-
-  // Tokenise: split on spaces, but keep group brackets intact
-  // Strategy: walk character by character collecting tokens
   const str = notation.trim();
   let i = 0;
 
   while (i < str.length) {
-    // Skip spaces
     if (str[i] === ' ') { i++; continue; }
 
     // ── Normal group (s r g) ───────────────────────────────────────────────
@@ -2753,9 +2974,8 @@ function parsePhrase(notation, matra) {
       const end = str.indexOf(')', i);
       const inner = str.slice(i + 1, end).trim().split(/\s+/);
       const notes = inner.map(tok => parseSwaramToken(tok));
-      // Each note: 1 matra, no gap within; 1 matra gap after last
       for (let j = 0; j < notes.length; j++) {
-        events.push({ ...notes[j], noteDur: matra, gap: j === notes.length - 1 ? matra : 0 });
+        events.push({ ...notes[j], noteDur: matra, gap: j === notes.length - 1 ? 0.020 : 0 });
       }
       i = end + 1;
       continue;
@@ -2766,9 +2986,8 @@ function parsePhrase(notation, matra) {
       const end = str.indexOf('}', i);
       const inner = str.slice(i + 1, end).trim().split(/\s+/);
       const notes = inner.map(tok => parseSwaramToken(tok));
-      // Each note: 0.5 matra, no gap within; 1 matra gap after last
       for (let j = 0; j < notes.length; j++) {
-        events.push({ ...notes[j], noteDur: matra * 0.5, gap: j === notes.length - 1 ? matra : 0 });
+        events.push({ ...notes[j], noteDur: matra * 0.5, gap: j === notes.length - 1 ? 0.020 : 0 });
       }
       i = end + 1;
       continue;
@@ -2779,27 +2998,26 @@ function parsePhrase(notation, matra) {
       const end = str.indexOf('|', i + 1);
       const inner = str.slice(i + 1, end).trim().split(/\s+/);
       const notes = inner.map(tok => parseSwaramToken(tok));
-      // Entire group = 1 matra, rendered as pitch glide
-      events.push({ cents: notes.map(n => n.cents), gamakam: 'glide', noteDur: matra, gap: matra });
+      events.push({ cents: notes.map(n => n.cents), gamakam: 'glide', noteDur: matra, gap: 0.020 });
       i = end + 1;
       continue;
     }
 
     // ── Plain swaram (possibly with gamakam suffix and commas) ────────────
-    // Collect until next space
     let j = i;
     while (j < str.length && str[j] !== ' ') j++;
     const raw = str.slice(i, j);
     i = j;
 
-    // Split off trailing commas (sustain markers)
     let commas = 0;
     let token = raw;
     while (token.endsWith(',')) { commas++; token = token.slice(0, -1); }
 
-    const note = parseSwaramToken(token);
-    const noteDur = matra * (1 + commas);  // e.g. s,, = 3 matras
-    events.push({ ...note, noteDur, gap: matra });
+    const note    = parseSwaramToken(token);
+    const noteDur = matra * (1 + commas);
+    // Sustained notes (nyasa swaras): 40ms breath; plain notes: 20ms
+    const gap = commas > 0 ? 0.040 : 0.020;
+    events.push({ ...note, noteDur, gap });
   }
 
   return events;
@@ -2825,143 +3043,272 @@ function parseSwaramToken(token) {
   return { cents, gamakam };
 }
 
-function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null, veenaMode = false) {
-  const gain = ctx.createGain();
+/* ── Raga-aware kampita depth table ────────────────────────────────────────
+ *  Kampita (oscillation) depth varies by swara AND by ragam character.
+ *  A generic ±50 cents on every note sounds "stiff" — a real singer applies
+ *  heavier oscillation on jiva swaras and near-flat on vadi/anchor notes.
+ *
+ *  Format: { ragamName: { centOffset: depthCents } }
+ *  centOffset = cents mod 1200 (maps any octave to the same entry).
+ *  Falls back to DEFAULT_KAMPITA_DEPTH (50¢) for unrecognised ragam/swara.
+ *
+ *  How to read Abhogi's entry:
+ *    g2 (300¢) → 70¢ oscillation: heavy, signature jiva swara
+ *    m1 (500¢) → 65¢: slightly lighter — vadi but still prominent
+ *    r2 (200¢) → 15¢: nearly flat — passing/shadowed in Abhogi
+ *    d2 (900¢) → 40¢: moderate — present but not as expressive as g2/m1
+ *    s  (0¢)   → 20¢: anchor note — very slight, mostly plain
+ */
+const DEFAULT_KAMPITA_DEPTH = 50; // cents — fallback for unlisted ragam/swara
 
-  const filter = ctx.createBiquadFilter();
-  filter.connect(gain);
+const RAGAM_KAMPITA_DEPTH = {
+  'Abhogi':    { 0: 20, 200: 15, 300: 70, 500: 65, 900: 40 },
+  'Bhairavi':  { 0: 20, 90: 55,  200: 25, 300: 65, 500: 55, 700: 20, 800: 60, 1000: 50 },
+  'Kambhoji':  { 0: 20, 200: 30, 400: 60, 500: 55, 700: 20, 900: 50, 1100: 40 },
+  'Kalyani':   { 0: 20, 200: 30, 400: 55, 600: 50, 700: 20, 900: 45, 1100: 60 },
+  'Shankarabharanam': { 0: 20, 200: 35, 400: 55, 500: 50, 700: 20, 900: 45, 1100: 55 },
+  'Todi':      { 0: 20, 90: 65,  200: 20, 300: 70, 500: 55, 700: 20, 800: 60, 1000: 50 },
+  'Varali':    { 0: 20, 90: 60,  200: 20, 300: 70, 600: 55, 700: 20, 800: 65, 1000: 50 },
+  'Natabhairavi': { 0: 20, 200: 30, 300: 65, 500: 55, 700: 20, 800: 60, 1000: 50 },
+  'Kharaharapriya': { 0: 20, 200: 40, 300: 55, 500: 55, 700: 20, 900: 50, 1000: 60 },
+  'Harikambhoji': { 0: 20, 200: 35, 400: 55, 500: 50, 700: 20, 900: 45, 1000: 50 },
+};
+
+/** Resolve kampita depth in cents for a given frequency within a ragam.
+ *  srutiSaHz  — frequency of Sa at current sruti (used to recover cents offset)
+ *  freq       — the note's frequency
+ *  ragamName  — current ragam name (from currentJanyaRecord or ragamSelect)
+ *  Returns depth in cents (integer). */
+function _kampitaDepth(freq, srutiSaHz, ragamName) {
+  const ragamEntry = RAGAM_KAMPITA_DEPTH[ragamName];
+  if (!ragamEntry) return DEFAULT_KAMPITA_DEPTH;
+  // Recover cents from Sa, reduce mod 1200 to get octave-independent swara offset
+  const centsFromSa = Math.round(1200 * Math.log2(Math.max(20, freq) / Math.max(20, srutiSaHz)));
+  const swaraCents  = ((centsFromSa % 1200) + 1200) % 1200; // always 0–1199
+  // Find closest swara entry within ±30 cents (handles slight sruti variations)
+  let best = null, bestDist = Infinity;
+  for (const [key, depth] of Object.entries(ragamEntry)) {
+    const dist = Math.abs(swaraCents - Number(key));
+    if (dist < bestDist && dist <= 30) { bestDist = dist; best = depth; }
+  }
+  return best ?? DEFAULT_KAMPITA_DEPTH;
+}
+
+/* ── _buildVocalChain ──────────────────────────────────────────────────────
+ *  Shared vocal signal chain used by playNote AND playGlide so both functions
+ *  produce an identical timbre. The chain is:
+ *    [osc1(saw,38%) + osc2(tri,62%)] × driftLFO(±4¢, 2.8Hz)
+ *    → oscMix → warmthLP(LP 2800Hz Q=0.6) → presenceBP(BP 1200Hz Q=3)
+ *    → fMix(0.85) → gain → masterGain
+ *
+ *  Why serial not parallel: parallel bandpass filters cause phase cancellation
+ *  that thins the sound. A serial LP+BP chain mimics the vocal tract: the
+ *  glottis generates harmonics, the pharynx rolls off highs, the oral cavity
+ *  adds one presence peak. No WaveShaper grit — it adds harshness at these
+ *  gain levels, not warmth.
+ *
+ *  Returns { osc1, osc2 } — caller sets frequency automation and start/stop.
+ */
+function _buildVocalChain(ctx, t0, t_end, peakGain) {
+  const gain = ctx.createGain();
   gain.connect(masterGain);
 
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
-  const g1   = ctx.createGain();
-  const g2   = ctx.createGain();
-  osc1.connect(g1).connect(filter);
-  osc2.connect(g2).connect(filter);
+  osc1.type = 'sawtooth'; // vocal cord buzz — rich in odd+even harmonics
+  osc2.type = 'triangle'; // chest resonance — strong fundamental, few overtones
 
+  const g1 = ctx.createGain(); g1.gain.value = 0.38; // less buzz
+  const g2 = ctx.createGain(); g2.gain.value = 0.62; // more body
+  osc1.connect(g1);
+  osc2.connect(g2);
+
+  // Breath drift LFO — ±4 cents at 2.8 Hz (subtle, not wobbly)
+  const driftLfo  = ctx.createOscillator();
+  const driftGain = ctx.createGain();
+  driftLfo.type            = 'sine';
+  driftLfo.frequency.value = 2.8 + (Math.random() - 0.5) * 0.4;
+  driftGain.gain.value     = 4;
+  driftLfo.connect(driftGain);
+  driftGain.connect(osc1.detune);
+  driftGain.connect(osc2.detune);
+  driftLfo.start(t0);
+  driftLfo.stop(t_end + 0.05);
+
+  // Serial filter chain
+  const oscMix = ctx.createGain(); oscMix.gain.value = 1.0;
+  g1.connect(oscMix);
+  g2.connect(oscMix);
+
+  const warmthLP   = ctx.createBiquadFilter();
+  warmthLP.type    = 'lowpass';
+  warmthLP.Q.value = 0.6;
+
+  const presenceBP   = ctx.createBiquadFilter();
+  presenceBP.type    = 'bandpass';
+  presenceBP.Q.value = 3;
+
+  // Glottal sweep: 4% overshoot only, 50ms settle — sounds like throat
+  // opening, not a filter zap. Both filters sweep together.
+  const sweepEnd = t0 + 0.05;
+  warmthLP.frequency.setValueAtTime(2800 * 1.04, t0);
+  warmthLP.frequency.exponentialRampToValueAtTime(2800, sweepEnd);
+  presenceBP.frequency.setValueAtTime(1200 * 1.04, t0);
+  presenceBP.frequency.exponentialRampToValueAtTime(1200, sweepEnd);
+
+  oscMix.connect(warmthLP);
+  warmthLP.connect(presenceBP);
+
+  const fMix = ctx.createGain(); fMix.gain.value = 0.85;
+  presenceBP.connect(fMix);
+  fMix.connect(gain);
+
+  // Gain envelope
+  const dur = t_end - t0;
+  const atk = Math.min(0.030, Math.max(0.012, dur * 0.07));
+  const releaseFloor = dur >= 0.45 ? 0.001 : 0.15;
+  const rel = 0.020;
+
+  gain.gain.setValueAtTime(0.001, t0);
+  gain.gain.exponentialRampToValueAtTime(peakGain,     t0 + atk);
+  gain.gain.setValueAtTime(peakGain * 0.90,            t_end - rel);
+  gain.gain.exponentialRampToValueAtTime(releaseFloor, t_end);
+
+  osc2.onended = () => {
+    try {
+      oscMix.disconnect(); warmthLP.disconnect(); presenceBP.disconnect();
+      fMix.disconnect(); gain.disconnect();
+    } catch (_) {}
+  };
+
+  return { osc1, osc2 };
+}
+
+function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null, veenaMode = false, srutiSaHz = null, ragamName = null) {
   const t_end = t0 + dur;
 
   if (veenaMode) {
     // ── Veena pluck timbre — UNCHANGED ─────────────────────────────────────
-    osc1.type      = 'sawtooth';
-    osc2.type      = 'triangle';
-    osc2.detune.value = 5;
-    g1.gain.value  = 0.60;
-    g2.gain.value  = 0.40;
-
+    const gain   = ctx.createGain(); gain.connect(masterGain);
+    const filter = ctx.createBiquadFilter(); filter.connect(gain);
+    const osc1   = ctx.createOscillator();
+    const osc2   = ctx.createOscillator();
+    const g1 = ctx.createGain(); g1.gain.value = 0.60;
+    const g2 = ctx.createGain(); g2.gain.value = 0.40;
+    osc1.connect(g1).connect(filter);
+    osc2.connect(g2).connect(filter);
+    osc1.type = 'sawtooth'; osc2.type = 'triangle'; osc2.detune.value = 5;
     filter.type = 'lowpass';
     filter.frequency.setValueAtTime(3000, t0);
     filter.frequency.exponentialRampToValueAtTime(800, t0 + 0.2);
-
     gain.gain.setValueAtTime(0.001, t0);
     gain.gain.exponentialRampToValueAtTime(0.75,  t0 + 0.005);
     gain.gain.exponentialRampToValueAtTime(0.30,  t0 + 0.08);
     gain.gain.exponentialRampToValueAtTime(0.001, t_end);
-
     const noiseBuffer = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * 0.02), ctx.sampleRate);
     const data = noiseBuffer.getChannelData(0);
     for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-    const noise     = ctx.createBufferSource();
-    noise.buffer    = noiseBuffer;
+    const noise = ctx.createBufferSource(); noise.buffer = noiseBuffer;
     const noiseGain = ctx.createGain();
     noiseGain.gain.setValueAtTime(0.25, t0);
     noiseGain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.02);
     noise.connect(noiseGain).connect(gain);
     noise.start(t0);
-
-  } else {
-    // ── Harmonium timbre — CHANGED ──────────────────────────────────────────
-    // CHANGE 1: sawtooth+sawtooth with 7¢ detune (was triangle+sawtooth, octave doubler)
-    // CHANGE 2: lowpass at 2200Hz (was bandpass at 900Hz Q=1.4 — was killing the fundamental)
-    // CHANGE 3: exponential ramps, 15ms release (was linear, 120ms release overrunning the 20ms gap)
-
-    osc1.type         = 'sawtooth';
-    osc2.type         = 'sawtooth';
-    osc2.detune.value = 7;          // 7¢ chorus — warmth, not octave doubling
-    g1.gain.value     = 0.60;
-    g2.gain.value     = 0.40;
-
-    filter.type            = 'lowpass';
-    filter.frequency.value = 2200;
-    filter.Q.value         = 0.8;
-
-    const peakGain = (gamakam === 'kampita' || gamakam === 'andola') ? 0.58 : 0.55;
-    const atk      = Math.min(0.025, Math.max(0.008, dur * 0.06));
-    const rel      = 0.015;
-
-    gain.gain.setValueAtTime(0.001,           t0);
-    gain.gain.exponentialRampToValueAtTime(peakGain,        t0 + atk);
-    gain.gain.setValueAtTime(peakGain * 0.85,               t_end - rel);
-    gain.gain.exponentialRampToValueAtTime(0.001,           t_end);
+    osc1.frequency.value = freq; osc2.frequency.value = freq;
+    osc1.start(t0); osc2.start(t0);
+    osc1.stop(t_end + 0.05); osc2.stop(t_end + 0.05);
+    osc2.onended = () => { try { filter.disconnect(); gain.disconnect(); } catch (_) {} };
+    return;
   }
 
-  // ── Pitch automation helpers — CHANGED osc2FreqOf only ───────────────────
-  // osc2 is now a chorus detune in BOTH modes, not an octave doubler in vocal mode.
-  // So osc2FreqOf always returns hz unchanged — the detune.value handles the spread.
-  const osc2FreqOf = (hz) => Math.max(20, hz);   // was: veenaMode ? hz : hz * 2
+  // ── Vocal branch — shared chain ───────────────────────────────────────────
+  // ACOUSTIC BALANCE: Raised from 0.62/0.58 → 0.78/0.74 so phrase notes,
+  // janya aro/ava, and raga lakshanam content sit clearly above the 14% tanpura.
+  const peakGain = (gamakam === 'kampita' || gamakam === 'andola') ? 0.78 : 0.74;
+  const { osc1, osc2 } = _buildVocalChain(ctx, t0, t_end, peakGain);
 
-  const setF  = (hz, t) => {
+  // ── Frequency helpers — both oscs at same pitch (osc2 is chorus partner) ─
+  const setF = (hz, t) => {
     osc1.frequency.setValueAtTime(Math.max(20, hz), t);
-    osc2.frequency.setValueAtTime(osc2FreqOf(hz),   t);
+    osc2.frequency.setValueAtTime(Math.max(20, hz), t);
   };
-  const rampF = (hz, t) => {
-    osc1.frequency.linearRampToValueAtTime(Math.max(20, hz), t);
-    osc2.frequency.linearRampToValueAtTime(osc2FreqOf(hz),   t);
-  };
-  const expF  = (hz, t) => {
+  const expF = (hz, t) => {
     osc1.frequency.exponentialRampToValueAtTime(Math.max(20, hz), t);
-    osc2.frequency.exponentialRampToValueAtTime(osc2FreqOf(hz),   t);
+    osc2.frequency.exponentialRampToValueAtTime(Math.max(20, hz), t);
   };
 
-  const startF = veenaMode
-    ? (fromFreq ?? freq * 1.01)
-    : (fromFreq ?? freq);
+  // ── Per-gamakam pitch automation ─────────────────────────────────────────
 
-  // ── Per-gamakam pitch curves — UNCHANGED ─────────────────────────────────
-
-  if (gamakam === 'none' || !gamakam) {
+  if (!gamakam || gamakam === 'none') {
     if (fromFreq && Math.abs(fromFreq - freq) > 1) {
-      setF(fromFreq, t0);
-      expF(freq, t0 + Math.min(0.06, dur * 0.15));
+      // Inter-note legato: S-curve glide from previous pitch, 22% of note dur
+      const slideDur = Math.min(0.06, dur * 0.22);
+      const scCurve  = getSCurveHz(fromFreq, freq, freq, 96);
+      osc1.frequency.setValueCurveAtTime(scCurve, t0, slideDur);
+      osc2.frequency.setValueCurveAtTime(scCurve, t0, slideDur);
+      setF(freq, t0 + slideDur);
     } else {
-      setF(freq, t0);
+      // First note: 0.8% upward scoop over 12ms — removes mechanical attack
+      // without sounding like a detune artifact (was 1.5%/20ms — too obvious)
+      const scoopStart = freq * 0.992;
+      osc1.frequency.setValueAtTime(scoopStart, t0);
+      osc2.frequency.setValueAtTime(scoopStart, t0);
+      osc1.frequency.exponentialRampToValueAtTime(Math.max(20, freq), t0 + 0.012);
+      osc2.frequency.exponentialRampToValueAtTime(Math.max(20, freq), t0 + 0.012);
     }
 
   } else if (gamakam === 'kampita') {
-    const delay  = 0.08;
-    const depth  = Math.pow(2, 50 / 1200);
-    const period = 1 / 5;
-    const tStart = t0 + delay;
+    // FIX: settle reduced from 80ms → 30ms so oscillation is heard immediately.
+    // On a 350ms note at 5Hz: 80ms settle left only 1.35 cycles (barely audible);
+    // 30ms settle leaves 1.6 cycles — the signature oscillation is clearly heard.
+    const settle  = Math.min(0.030, dur * 0.08);
+    const rateHz  = 5;
+    // Raga-aware kampita depth: jiva swaras oscillate more heavily than
+    // passing/anchor swaras. Falls back to 50¢ for unrecognised ragam.
+    const _kdepth  = (srutiSaHz && ragamName)
+      ? _kampitaDepth(freq, srutiSaHz, ragamName)
+      : DEFAULT_KAMPITA_DEPTH;
+    const depthHz  = freq * Math.pow(2, _kdepth / 1200) - freq;
+    const tStart  = t0 + settle;
 
-    setF(startF, t0);
-    if (startF !== freq) expF(freq, tStart);
+    setF(fromFreq ?? freq, t0);
+    if (fromFreq && Math.abs(fromFreq - freq) > 1) expF(freq, tStart);
     else setF(freq, tStart);
 
-    let tc = tStart;
-    while (tc + period < t_end - 0.05) {
-      rampF(freq * depth,     tc + period * 0.30);
-      rampF(freq / depth,     tc + period * 0.70);
-      rampF(freq,             tc + period);
-      tc += period;
+    const curveDur = Math.max(0, t_end - tStart);
+    if (curveDur > 0.01) {
+      const sr  = 120;
+      const len = Math.max(2, Math.ceil(curveDur * sr));
+      const cur = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        // FIX: taper in over 20ms (was 40ms) — faster ramp-up matches how a
+        // singer immediately applies oscillation on jiva swaras like g2 in Abhogi
+        const taper = Math.min(1, i / (sr * 0.02));
+        cur[i] = Math.max(20, freq + depthHz * Math.sin(i / sr * rateHz * 2 * Math.PI) * taper);
+      }
+      osc1.frequency.setValueCurveAtTime(cur, tStart, curveDur);
+      osc2.frequency.setValueCurveAtTime(cur, tStart, curveDur);
     }
-    rampF(freq, t_end - 0.03);
+    setF(freq, t_end);
 
   } else if (gamakam === 'andola') {
-    const depth  = Math.pow(2, 120 / 1200);
-    const period = 1 / 2.5;
-    const tStart = t0;
-
-    setF(startF, t0);
-    if (startF !== freq) expF(freq, t0 + 0.04);
-
-    let tc = tStart;
-    while (tc + period < t_end - 0.05) {
-      rampF(freq * depth,     tc + period * 0.30);
-      rampF(freq / depth,     tc + period * 0.70);
-      rampF(freq,             tc + period);
-      tc += period;
+    const rateHz  = 2.5;
+    const depthHz = freq * Math.pow(2, 120 / 1200) - freq;
+    setF(fromFreq ?? freq, t0);
+    if (fromFreq && Math.abs(fromFreq - freq) > 1) expF(freq, t0 + 0.04);
+    const curveDur = Math.max(0, dur);
+    if (curveDur > 0.01) {
+      const sr  = 120;
+      const len = Math.max(2, Math.ceil(curveDur * sr));
+      const cur = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        const taper = Math.min(1, i / (sr * 0.08));
+        cur[i] = Math.max(20, freq + depthHz * Math.sin(i / sr * rateHz * 2 * Math.PI) * taper);
+      }
+      osc1.frequency.setValueCurveAtTime(cur, t0, curveDur);
+      osc2.frequency.setValueCurveAtTime(cur, t0, curveDur);
     }
-    rampF(freq, t_end - 0.03);
+    setF(freq, t_end);
 
   } else if (gamakam === 'sphurita') {
     const upper = freq * Math.pow(2, 100 / 1200);
@@ -2976,19 +3323,22 @@ function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null, veenaMode = fals
     setF(freq,  t0 + 0.06);
 
   } else if (gamakam === 'meend_in') {
+    // FIX: clamp slide to 30% of note dur — on short notes (0.28s) the old
+    // fixed 130ms ate half the note; pitch never had time to settle
+    const slideDur = Math.min(0.13, dur * 0.30);
     const below    = freq * Math.pow(2, -100 / 1200);
-    const slideDur = 0.13;
-    setF(below, t0);
-    expF(freq,  t0 + slideDur);
-    setF(freq,  t0 + slideDur);
+    setF(fromFreq ?? below, t0);
+    expF(freq, t0 + slideDur);
+    setF(freq, t0 + slideDur);
 
   } else if (gamakam === 'meend_out') {
+    // FIX: clamp slide to 30% of note dur
+    const slideDur   = Math.min(0.11, dur * 0.30);
     const toFreq     = freq * Math.pow(2, -80 / 1200);
-    const slideDur   = 0.11;
     const slideStart = t_end - slideDur;
-    setF(startF, t0);
-    if (startF !== freq) expF(freq, t0 + 0.06);
-    setF(freq,  slideStart);
+    setF(fromFreq ?? freq, t0);
+    if (fromFreq && Math.abs(fromFreq - freq) > 1) expF(freq, t0 + 0.04);
+    setF(freq,   slideStart);
     expF(toFreq, t_end);
 
   } else {
@@ -2996,66 +3346,45 @@ function playNote(ctx, freq, dur, t0, gamakam, fromFreq = null, veenaMode = fals
   }
 
   osc1.start(t0); osc2.start(t0);
-  const stopT = veenaMode ? t_end + 0.05 : t_end + 0.02;
-  osc1.stop(stopT); osc2.stop(stopT);
-  osc2.onended = () => { try { filter.disconnect(); gain.disconnect(); } catch (_) {} };
+  osc1.stop(t_end + 0.02); osc2.stop(t_end + 0.02);
 }
 
 /* ── playGlide ──────────────────────────────────────────────────────────────
  *  Renders a smooth pitch glide across an array of cent values.
- *  cents[]  — array of cent offsets from Sa (e.g. [0, 700, 1200])
+ *  cents[]   — cent offsets from Sa (e.g. [0, 700, 1200])
  *  srutiSaHz — frequency of Sa at the current sruti
- *  durSec   — total duration of the glide in seconds
- *  t0       — Web Audio start time
+ *  durSec    — total duration of the glide in seconds
+ *  t0        — Web Audio start time
  *
- *  Uses a single continuous oscillator pair (same timbre as playNote) with
- *  exponentialRampToValueAtTime spreading the control points evenly over durSec.
+ *  FIX: Now uses _buildVocalChain (same warmthLP→presenceBP serial chain as
+ *  playNote) so glides and notes are timbrally identical. The old 3-formant +
+ *  grit WaveShaper chain caused audible discontinuities when a glide followed
+ *  a note — it sounded like a different instrument for that moment.
  */
 function playGlide(ctx, cents, srutiSaHz, durSec, t0) {
   if (!cents || cents.length < 2 || durSec <= 0) return;
 
-  const gain = ctx.createGain();
+  const t_end = t0 + durSec;
+  const { osc1, osc2 } = _buildVocalChain(ctx, t0, t_end, 0.60);
 
-  // Same vocal-formant timbre as playNote for timbral consistency
-  const filter = ctx.createBiquadFilter();
-  filter.type            = 'bandpass';
-  filter.frequency.value = 900;
-  filter.Q.value         = 1.4;
-  filter.connect(gain);
-  gain.connect(masterGain);
-
-  // Gain tail extends 100 ms past durSec — keeps pitch sweep audible through
-  // its full arc and overlaps the next note's attack for continuity.
-  gain.gain.setValueAtTime(0.001, t0);
-  gain.gain.linearRampToValueAtTime(0.65, t0 + Math.min(0.08, durSec * 0.15));
-  gain.gain.setValueAtTime(0.55,          t0 + durSec * 0.75);
-  gain.gain.linearRampToValueAtTime(0.001, t0 + durSec + 0.10);
-
-  const osc1 = ctx.createOscillator(); osc1.type = 'triangle';
-  const osc2 = ctx.createOscillator(); osc2.type = 'sawtooth';
-  const g1   = ctx.createGain(); g1.gain.value = 0.70;
-  const g2   = ctx.createGain(); g2.gain.value = 0.30;
-  osc1.connect(g1).connect(filter);
-  osc2.connect(g2).connect(filter);
-
-  // Space control points evenly across durSec
+  // ── S-curve pitch automation between each control point ──────────────────
   const step = durSec / (cents.length - 1);
-  cents.forEach((c, i) => {
-    const freq = Math.max(20, srutiSaHz * Math.pow(2, c / 1200));
-    const tAbs = t0 + i * step;
-    if (i === 0) {
-      osc1.frequency.setValueAtTime(freq,     tAbs);
-      osc2.frequency.setValueAtTime(freq * 2, tAbs);
-    } else {
-      osc1.frequency.exponentialRampToValueAtTime(freq,     tAbs);
-      osc2.frequency.exponentialRampToValueAtTime(freq * 2, tAbs);
-    }
-  });
+  let prevFreq = Math.max(20, srutiSaHz * Math.pow(2, cents[0] / 1200));
+  osc1.frequency.setValueAtTime(prevFreq, t0);
+  osc2.frequency.setValueAtTime(prevFreq, t0);
+
+  for (let i = 1; i < cents.length; i++) {
+    const nextFreq = Math.max(20, srutiSaHz * Math.pow(2, cents[i] / 1200));
+    const segStart = t0 + (i - 1) * step;
+    const segDur   = Math.max(0.001, step);
+    const scCurve  = getSCurveHz(prevFreq, nextFreq, srutiSaHz, 96);
+    osc1.frequency.setValueCurveAtTime(scCurve, segStart, segDur);
+    osc2.frequency.setValueCurveAtTime(scCurve, segStart, segDur);
+    prevFreq = nextFreq;
+  }
 
   osc1.start(t0); osc2.start(t0);
-  const stopT = t0 + durSec + 0.15;
-  osc1.stop(stopT); osc2.stop(stopT);
-  osc2.onended = () => { try { filter.disconnect(); gain.disconnect(); } catch (_) {} };
+  osc1.stop(t_end + 0.12); osc2.stop(t_end + 0.12);
 }
 
 
@@ -3134,6 +3463,21 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
   if (efData.render_v2?.sequenced_events?.length > 0) {
 
     const events      = efData.render_v2.sequenced_events;
+
+    // ── Gap clamping: DB rows generated before the edge-fn fix may have
+    // inter-note gaps of 350ms (1 matra) within a phrase. Clamp any gap
+    // that is larger than 25ms but smaller than a phrase boundary (150ms)
+    // to 25ms so phrases play legato. Phrase-boundary pauses (≥ 150ms) and
+    // the localGAP pauses (≥ 1s) are left untouched.
+    const INTER_NOTE_MAX_GAP = 0.025;
+    const PHRASE_MIN_GAP     = 0.150;
+    for (const ev of events) {
+      if ((ev.type === 'note' || ev.type === 'glide') &&
+          (ev.gap ?? 0) > INTER_NOTE_MAX_GAP && (ev.gap ?? 0) < PHRASE_MIN_GAP) {
+        ev.gap = INTER_NOTE_MAX_GAP;
+      }
+    }
+
     const ragaTypeNow = document.querySelector("input[name=ragaType]:checked")?.value;
     const isJanya     = (ragaTypeNow === 'janya');
 
@@ -3141,6 +3485,15 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
     // playNote() call so oscillators begin at the previous pitch (legato).
     // Cleared at phrase boundaries (pause events >= LEGATO_RESET_DUR) and
     // at every label event so each phrase has a clean defined attack.
+    // Resolve current ragam name for raga-aware kampita depth
+    const _currentRagamName = (() => {
+      const rt = document.querySelector("input[name=ragaType]:checked")?.value;
+      if (rt === 'janya') return currentJanyaRecord?.name ?? null;
+      if (rt === 'sampoorna') return melakarta_dict[ragamSelect.value]?.[0] ?? null;
+      if (rt === 'audava' || rt === 'shadava') return ragamSelect.value ?? null;
+      return null;
+    })();
+
     let prevFreq = null;
     const LEGATO_RESET_DUR = 0.15; // pauses shorter than this keep legato
 
@@ -3164,7 +3517,7 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
 
         // fromFreq seeds the oscillator at the previous note's landing pitch,
         // giving legato continuity. playNote() falls back gracefully when null.
-        playNote(ctx, freq, ev.noteDur, t, gamakam, prevFreq, false); // harmonium timbre
+        playNote(ctx, freq, ev.noteDur, t, gamakam, prevFreq, false, srutiSaHz, _currentRagamName); // raga-aware
         t += ev.noteDur + (ev.gap ?? 0);
 
         // meend_out leaves pitch below the nominal — next note seeds from tail.
@@ -3220,7 +3573,10 @@ async function playSignaturePhrases(ragamId, srutiFactor, bpm, mySessionId) {
   const engine             = new GamakamEngine(ctx, masterGain);
   const allGamakamProfiles = efData.allGamakamProfiles ?? {};
   const oneBeat            = 60 / bpm;
-  const MATRA              = 0.35;
+  // FIX (Step C): 0.28s per matra 2248 70-75 BPM alapana pace.
+  // 0.35s was "1st-speed varisai" pace 2014 too slow for raga lakshana phrases
+  // which should feel like a moderate, natural vocal rendering.
+  const MATRA              = 0.28;
   const GAP_SEC            = 1.2;
  
   for (const phrase of phrases) {
